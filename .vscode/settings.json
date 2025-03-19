@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "builtins.h": "c",
+        "nodefuncs.h": "c",
+        "parse_oper.h": "c",
+        "postgres.h": "c",
+        "pg_type.h": "c",
+        "c.h": "c",
+        "postgres_ext.h": "c"
+    }
+}

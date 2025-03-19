@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "fdw_win_test",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "D:\\计院文件\\FDW\\postgresql-15.3\\src\\include"  // 替换为你的PostgreSQL源码的include目录路径
+            ],
+            "defines": [],
+            "compilerPath": "cl.exe",  // 根据你的实际情况修改编译器路径
+            "cStandard": "c11",
+            "cppStandard": "c++11",
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ],
+    "version": 4
+}
