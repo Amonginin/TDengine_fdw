@@ -4,20 +4,37 @@
         {
             "label": "build",
             "type": "shell",
-            "command": "gcc",
+            "command": "g++",
             "args": [
                 "-g",
                 "-o",
-                "${workspaceFolder}/connection_test",
-                "${workspaceFolder}/connection_test.cpp",
+                "${fileDirname}/${fileBasenameNoExtension}",
+                "${file}",
                 "-L/usr/local/taos/driver",
-                "-ltaosws"
+                "-ltaosws",
+                "-Wall",
+                "-std=c++11"
             ],
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "problemMatcher": []
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "problemMatcher": {
+                "owner": "cpp",
+                "fileLocation": ["relative", "${workspaceFolder}"],
+                "pattern": {
+                    "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            }
         }
     ]
 }

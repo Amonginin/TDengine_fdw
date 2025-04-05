@@ -1,3 +1,5 @@
+// 测试：建立连接
+
 // compile with
 // gcc connect_example.c -o connect_example -ltaos
 #include <stdio.h>
