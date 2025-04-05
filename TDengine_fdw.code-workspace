@@ -1,0 +1,33 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../influxdb-cxx"
+		},
+		{
+			"path": "../influxdb_fdw"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"builtins.h": "c",
+			"nodefuncs.h": "c",
+			"parse_oper.h": "c",
+			"postgres.h": "c",
+			"pg_type.h": "c",
+			"c.h": "c",
+			"postgres_ext.h": "c",
+			"tdengine_fdw.h": "c",
+			"foreign.h": "c",
+			"stringinfo.h": "c",
+			"float.h": "c",
+			"optimizer.h": "c",
+			"table.h": "c",
+			"fmgr.h": "c",
+			"rel.h": "c",
+			"pathnodes.h": "c"
+		}
+	}
+}

@@ -1,4 +1,4 @@
-#include "tdengin_fdw.h"
+#include "tdengine_fdw.h"
 
 /**
  * 外部定义的 PG 初始化函数，模块加载时会被调用

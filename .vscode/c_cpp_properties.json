@@ -1,16 +1,17 @@
 {
     "configurations": [
         {
-            "name": "fdw_win_test",
+            "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "D:\\计院文件\\FDW\\postgresql-15.3\\src\\include"  // 替换为你的PostgreSQL源码的include目录路径
+                "/home/postgres/tools/postgresql-15.3/src/include",
+                "/usr/local/taos/include"
             ],
             "defines": [],
-            "compilerPath": "cl.exe",  // 根据你的实际情况修改编译器路径
+            "compilerPath": "/usr/bin/gcc",
             "cStandard": "c11",
-            "cppStandard": "c++11",
-            "intelliSenseMode": "windows-msvc-x64"
+            "cppStandard": "gnu++11",
+            "intelliSenseMode": "linux-gcc-x64"
         }
     ],
     "version": 4

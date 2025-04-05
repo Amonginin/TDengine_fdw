@@ -1,6 +1,56 @@
-#include "slvars.c"
-#include "deparse.c"
+#include "postgres.h"
+
 #include "tdengine_fdw.h"
+
+#include <stdio.h>
+
+#include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
+#include "nodes/makefuncs.h"
+#include "storage/ipc.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/numeric.h"
+#include "utils/date.h"
+#include "utils/datetime.h"
+#include "utils/hsearch.h"
+#include "utils/syscache.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/timestamp.h"
+#include "utils/formatting.h"
+#include "utils/memutils.h"
+#include "utils/guc.h"
+#include "access/htup_details.h"
+#include "access/sysattr.h"
+#include "access/reloptions.h"
+#include "commands/defrem.h"
+#include "commands/explain.h"
+#include "commands/vacuum.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/cost.h"
+#include "optimizer/paths.h"
+#include "optimizer/prep.h"
+#include "optimizer/restrictinfo.h"
+#include "optimizer/cost.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/plancat.h"
+#include "optimizer/planmain.h"
+#include "parser/parsetree.h"
+#include "catalog/pg_type.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "postmaster/syslogger.h"
+#include "storage/fd.h"
+#include "catalog/pg_type.h"
+
+ /* If no remote estimates, assume a sort costs 20% extra */
+ #define DEFAULT_FDW_SORT_MULTIPLIER 1.2
+
+
 
 extern PGDLLEXPORT void _PG_init(void);
 
@@ -37,6 +87,23 @@ static TupleTableSlot *tdengineIterateForeignScan(ForeignScanState *node);
 static void tdengineReScanForeignScan(ForeignScanState *node);
 // 释放整个ForeignScan算子执行过程中占用的外部资源或FDW中的资源
 static void tdengineEndForeignScan(ForeignScanState *node);
+
+/*
+ * 此枚举描述了 ForeignPath 的 fdw_private 列表中存储的内容。
+ * 存储以下信息：
+ *
+ * 1) 一个布尔标志，表明远程查询是否进行了最终排序
+ * 2) 一个布尔标志，表明远程查询是否包含 LIMIT 子句
+ */
+enum FdwPathPrivateIndex
+{
+    /* 有最终排序标志（以布尔节点形式） */
+    FdwPathPrivateHasFinalSort,
+    /* 有 LIMIT 子句标志（以布尔节点形式） */
+    FdwPathPrivateHasLimit,
+};
+
+
 
 /*
  * Library load-time initialization, sets on_proc_exit() callback for
@@ -382,8 +449,8 @@ tdengineGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntab
     else
     {
         /*
-         * 如果不允许咨询远程服务器，我们能做的不多，但我们可以使用类似于 plancat.c 中
-         * 处理空关系的方法：使用最小大小估计为 10 页，并除以基于列数据类型的宽度估计，
+         * 如果不允许询问远程服务器，可以使用类似于 plancat.c 中处理空关系的方法：
+         * 使用最小大小估计为 10 页，并除以基于列数据类型的宽度估计，
          * 以获得相应的元组数。
          */
 
@@ -413,8 +480,703 @@ tdengineGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntab
 
     /*
      * 在构造 fpinfo 时设置关系的名称。它将用于在 EXPLAIN 输出中构建描述连接关系的字符串。
-     * 我们无法知道是否指定了 VERBOSE 选项，因此总是对外部表名进行模式限定。
+     * 无法知道是否指定了 VERBOSE 选项，因此总是对外部表名进行模式限定。
      */
     // 将 baserel 的 relid 转换为字符串，并存储在 fpinfo 的 relation_name 字段中
     fpinfo->relation_name = psprintf("%u", baserel->relid);
 }
+
+
+//========================== GetForeignPaths ====================
+/*
+ *      为对外表的扫描创建可能的扫描路径
+ */
+static void
+tdengineGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
+{
+    // 启动成本初始化为 10
+    Cost        startup_cost = 10;
+    // 总成本初始化为表的行数加上启动成本
+    Cost        total_cost = baserel->rows + startup_cost;
+
+    // 输出调试信息，显示当前函数名
+    elog(DEBUG1, "tdengine_fdw : %s", __func__);
+    /* 估算成本 */
+    // 重新设置总成本为表的行数
+    total_cost = baserel->rows;
+
+    /* 创建一个 ForeignPath 节点并将其作为唯一可能的路径添加 */
+    add_path(baserel, (Path *)
+             // 创建一个外部扫描路径
+             create_foreignscan_path(root, baserel,
+                                     NULL,    /* 默认的路径目标 */
+                                     baserel->rows,
+                                     startup_cost,
+                                     total_cost,
+                                     NIL,    /* 没有路径键 */
+// #if (PG_VERSION_NUM >= 120000)
+                                     baserel->lateral_relids,
+// #else
+//                                      NULL,    /* 也没有外部关系 */
+// #endif
+                                     NULL,    /* 没有额外的计划 */
+// #if PG_VERSION_NUM >= 170000
+//                                      NIL, /* 没有 fdw_restrictinfo 列表 */
+// #endif
+                                     NULL));    /* 没有 fdw_private 数据 */
+}
+
+//====================== GetForeignPlan ======================
+/*
+ * 获取一个外部扫描计划节点
+ */
+static ForeignScan *
+tdengineGetForeignPlan(PlannerInfo *root,
+                       RelOptInfo *baserel,
+                       Oid foreigntableid,
+                       ForeignPath *best_path,
+                       List *tlist,
+                       List *scan_clauses,
+                       Plan *outer_plan)
+{
+    // 将外部关系的私有数据转换为 TDengineFdwRelationInfo 
+    TDengineFdwRelationInfo *fpinfo = (TDengineFdwRelationInfo *) baserel->fdw_private;
+    // 获取扫描关系的ID
+    Index		scan_relid = baserel->relid;
+    // 传递给执行器的私有数据列表
+    List	   *fdw_private = NULL;
+    // 本地执行的表达式列表
+    List	   *local_exprs = NULL;
+    // 远程执行的表达式列表
+    List	   *remote_exprs = NULL;
+    // 参数列表
+    List	   *params_list = NULL;
+    // 传递给外部服务器的目标列表
+    List	   *fdw_scan_tlist = NIL;
+    // 远程条件列表
+    List	   *remote_conds = NIL;
+
+    StringInfoData sql;
+    // 从远程服务器检索的属性列表
+    List	   *retrieved_attrs;
+    // 遍历列表的迭代器
+    ListCell   *lc;
+    // 需要重新检查的条件列表
+    List	   *fdw_recheck_quals = NIL;
+    // 表示是否为 FOR UPDATE 操作的标志
+    int			for_update;
+    // 表示查询是否有 LIMIT 子句的标志
+    bool		has_limit = false;
+
+    // 调试信息
+    elog(DEBUG1, "tdengine_fdw : %s", __func__);
+
+    // 决定是否在目标列表中支持函数下推
+    fpinfo->is_tlist_func_pushdown = tdengine_is_foreign_function_tlist(root, baserel, tlist);
+
+    /*
+     * 获取由 tdengineGetForeignUpperPaths() 创建的 FDW 私有数据（如果有的话）。
+     */
+    if (best_path->fdw_private)
+    {
+// #if (PG_VERSION_NUM >= 150000)
+        // 从 FDW 私有数据中获取是否有 LIMIT 子句的标志
+        has_limit = boolVal(list_nth(best_path->fdw_private, FdwPathPrivateHasLimit));
+// #else
+//         has_limit = intVal(list_nth(best_path->fdw_private, FdwPathPrivateHasLimit));
+// #endif
+    }
+
+    /*
+     * 构建要发送执行的查询字符串，并识别要作为参数发送的表达式。
+     */
+
+    // 初始化 SQL 查询字符串
+    initStringInfo(&sql);
+
+    /*
+     * 将扫描子句分为可以在远程执行的和不能在远程执行的。
+     * 之前由 classifyConditions 确定为安全或不安全的 baserestrictinfo 子句分别存储在
+     * fpinfo->remote_conds 和 fpinfo->local_conds 中。
+     * 扫描子句列表中的其他内容将是连接子句，我们必须检查其是否可以在远程安全执行。
+     *
+     * 注意：这里看到的连接子句应该与之前 tdengineGetForeignPaths 检查的完全相同。
+     * 也许值得将之前完成的分类工作传递过来，而不是在这里重复进行。
+     *
+     * 此代码必须与 "extract_actual_clauses(scan_clauses, false)" 匹配，
+     * 除了关于远程执行还是本地执行的额外决策。
+     * 但是请注意，我们只从 local_exprs 列表中剥离 RestrictInfo 节点，
+     * 因为 appendWhereClause 期望的是 RestrictInfos 列表。
+     */
+    if ((baserel->reloptkind == RELOPT_BASEREL ||
+         baserel->reloptkind == RELOPT_OTHER_MEMBER_REL) &&
+        fpinfo->is_tlist_func_pushdown == false)
+    {
+        // 提取实际要从远程 TDengine 获取的列
+        tdengine_extract_slcols(fpinfo, root, baserel, tlist);
+
+        // 遍历扫描子句列表
+        foreach(lc, scan_clauses)
+        {
+            // 获取当前的限制信息节点
+            RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+            // 确保当前节点是 RestrictInfo 类型
+            Assert(IsA(rinfo, RestrictInfo));
+
+            // 忽略任何伪常量，它们会在其他地方处理
+            if (rinfo->pseudoconstant)
+                continue;
+
+            // 如果该条件在远程条件列表中
+            if (list_member_ptr(fpinfo->remote_conds, rinfo))
+            {
+                // 将该条件的子句添加到远程表达式列表中
+                remote_exprs = lappend(remote_exprs, rinfo->clause);
+            }
+            // 如果该条件在本地条件列表中
+            else if (list_member_ptr(fpinfo->local_conds, rinfo))
+            {
+                // 将该条件的子句添加到本地表达式列表中
+                local_exprs = lappend(local_exprs, rinfo->clause);
+            }
+            // 如果该条件可以在远程安全执行
+            else if (tdengine_is_foreign_expr(root, baserel, rinfo->clause, false))
+            {
+                // 将该条件的子句添加到远程表达式列表中
+                remote_exprs = lappend(remote_exprs, rinfo->clause);
+            }
+            else
+            {
+                // 否则将该条件的子句添加到本地表达式列表中
+                local_exprs = lappend(local_exprs, rinfo->clause);
+            }
+
+            /*
+             * 对于基础关系扫描，我们必须支持提前谓词求值（EPQ）重新检查，
+             * 这应该重新检查所有远程条件。
+             */
+            fdw_recheck_quals = remote_exprs;
+        }
+    }
+    else
+    {
+        /*
+         * 连接关系或上层关系 - 将扫描关系 ID 设置为 0。
+         */
+        scan_relid = 0;
+
+        /*
+         * 对于连接关系，baserestrictinfo 为空，并且我们目前不考虑参数化，
+         * 因此连接关系或上层关系也应该没有扫描子句。
+         */
+        if (fpinfo->is_tlist_func_pushdown == false)
+        {
+            // 确保扫描子句列表为空
+            Assert(!scan_clauses);
+        }
+
+        /*
+         * 相反，我们从 fdw_private 结构中获取要应用的条件。
+         */
+        // 提取实际的远程条件子句
+        remote_exprs = extract_actual_clauses(fpinfo->remote_conds, false);
+        // 提取实际的本地条件子句
+        local_exprs = extract_actual_clauses(fpinfo->local_conds, false);
+
+        /*
+         * 在这种情况下，我们将 fdw_recheck_quals 留空，因为我们永远不需要应用 EPQ 重新检查子句。
+         * 对于连接关系，EPQ 重新检查在其他地方处理 --- 参见 tdengineGetForeignJoinPaths()。
+         * 如果我们正在规划上层关系（即远程分组或聚合），则不需要进行 EPQ，
+         * 因为不允许使用 SELECT FOR UPDATE，
+         * 实际上我们不能将远程子句放入 fdw_recheck_quals 中，因为未聚合的变量在本地不可用。
+         */
+
+        /*
+         * 构建要从外部服务器获取的列的列表。
+         */
+        if (fpinfo->is_tlist_func_pushdown == true)
+        {
+            // 遍历目标列表
+            foreach(lc, tlist)
+            {
+                // 获取当前的目标项
+                TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+                /*
+                 * 从 FieldSelect 子句中提取函数，并添加到 fdw_scan_tlist 中，
+                 * 以便仅下推函数部分
+                 */
+                if (fpinfo->is_tlist_func_pushdown == true && IsA((Node *) tle->expr, FieldSelect))
+                {
+                    // 将提取的函数添加到 fdw_scan_tlist 中
+                    fdw_scan_tlist = add_to_flat_tlist(fdw_scan_tlist,
+                                                       tdengine_pull_func_clause((Node *) tle->expr));
+                }
+                else
+                {
+                    // 否则将目标项添加到 fdw_scan_tlist 中
+                    fdw_scan_tlist = lappend(fdw_scan_tlist, tle);
+                }
+            }
+
+            // 遍历本地条件列表
+            foreach(lc, fpinfo->local_conds)
+            {
+                // 获取当前的限制信息节点
+                RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+                // 存储变量列表
+                List *varlist = NIL;
+
+                // 从条件子句中提取无模式变量
+                varlist = tdengine_pull_slvars(rinfo->clause, baserel->relid,
+                                                      varlist, true, NULL, &(fpinfo->slinfo));
+
+                // 如果变量列表为空
+                if (varlist == NIL)
+                {
+                    // 从条件子句中提取变量
+                    varlist = pull_var_clause((Node *) rinfo->clause,
+                                              PVC_RECURSE_PLACEHOLDERS);
+                }
+
+                // 将变量列表添加到 fdw_scan_tlist 中
+                fdw_scan_tlist = add_to_flat_tlist(fdw_scan_tlist, varlist);
+            }
+        }
+        else
+        {
+            // 构建要解析的目标列表
+            fdw_scan_tlist = tdengine_build_tlist_to_deparse(baserel);
+        }
+
+        /*
+         * 确保外部计划生成的元组描述符与我们的扫描元组插槽匹配。
+         * 这是安全的，因为所有扫描和连接都支持投影，所以我们永远不需要插入结果节点。
+         * 此外，从外部计划的条件中移除本地条件，以免它们被评估两次，
+         * 一次由本地计划评估，一次由扫描评估。
+         */
+        if (outer_plan)
+        {
+            /*
+             * 目前，我们只考虑连接之外的分组和聚合。
+             * 涉及聚合或分组的查询不需要 EPQ 机制，因此这里不应该有外部计划。
+             */
+            Assert(baserel->reloptkind != RELOPT_UPPER_REL);
+            // 设置外部计划的目标列表
+            outer_plan->targetlist = fdw_scan_tlist;
+
+            // 遍历本地表达式列表
+            foreach(lc, local_exprs)
+            {
+                // 将外部计划转换为连接计划
+                Join	   *join_plan = (Join *) outer_plan;
+                // 获取当前的条件子句
+                Node	   *qual = lfirst(lc);
+
+                // 从外部计划的条件中移除当前条件子句
+                outer_plan->qual = list_delete(outer_plan->qual, qual);
+
+                /*
+                 * 对于内连接，外部扫描计划的本地条件也可能是连接条件的一部分。
+                 */
+                if (join_plan->jointype == JOIN_INNER)
+                {
+                    // 从连接计划的连接条件中移除当前条件子句
+                    join_plan->joinqual = list_delete(join_plan->joinqual,
+                                                      qual);
+                }
+            }
+        }
+    }
+
+    /*
+     * 构建要发送执行的查询字符串，并识别要作为参数发送的表达式。
+     */
+    // 重新初始化 SQL 查询字符串
+    initStringInfo(&sql);
+    // 为关系解析 SELECT 语句
+    tdengine_deparse_select_stmt_for_rel(&sql, root, baserel, fdw_scan_tlist,
+                                         remote_exprs, best_path->path.pathkeys,
+                                         false, &retrieved_attrs, &params_list, has_limit);
+
+    // 记住远程表达式，供 tdenginePlanDirectModify 可能使用
+    fpinfo->final_remote_exprs = remote_exprs;
+
+    // 初始化 FOR UPDATE 标志
+    for_update = false;
+    if (baserel->relid == root->parse->resultRelation &&
+        (root->parse->commandType == CMD_UPDATE ||
+         root->parse->commandType == CMD_DELETE))
+    {
+        /* 关系是 UPDATE/DELETE 目标，因此使用 FOR UPDATE */
+        for_update = true;
+    }
+
+    // 获取远程条件
+    if (baserel->reloptkind == RELOPT_UPPER_REL)
+    {
+        TDengineFdwRelationInfo *ofpinfo;
+
+        ofpinfo = (TDengineFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+        remote_conds = ofpinfo->remote_conds;
+    }
+    else
+        remote_conds = remote_exprs;
+
+    /*
+     * 构建将提供给执行器的 fdw_private 列表。
+     * 列表中的项必须与上面的 enum FdwScanPrivateIndex 匹配。
+     */
+    // 创建包含 SQL 查询字符串、检索的属性和 FOR UPDATE 标志的列表
+    fdw_private = list_make3(makeString(sql.data), retrieved_attrs, makeInteger(for_update));
+    // 将 fdw_scan_tlist 添加到 fdw_private 列表中
+    fdw_private = lappend(fdw_private, fdw_scan_tlist);
+    // 将函数下推标志添加到 fdw_private 列表中
+    fdw_private = lappend(fdw_private, makeInteger(fpinfo->is_tlist_func_pushdown));
+    // 将无模式标志添加到 fdw_private 列表中
+    fdw_private = lappend(fdw_private, makeInteger(fpinfo->slinfo.schemaless));
+    // 将远程条件添加到 fdw_private 列表中
+    fdw_private = lappend(fdw_private, remote_conds);
+
+    /*
+     * 根据目标列表、本地过滤表达式、远程参数表达式和 FDW 私有信息创建 ForeignScan 节点。
+     *
+     * 注意，远程参数表达式存储在完成的计划节点的 fdw_exprs 字段中；
+     * 我们不能将它们保存在私有状态中，因为那样它们将不会受到后续规划器处理的影响。
+     */
+    return make_foreignscan(tlist,
+                            local_exprs,
+                            scan_relid,
+                            params_list,
+                            fdw_private,
+                            fdw_scan_tlist,
+                            fdw_recheck_quals,
+                            outer_plan);
+}
+
+//========================== BeginForeignScan =====================
+/*
+ * 初始化对数据库的访问
+ */
+static void
+tdengineBeginForeignScan(ForeignScanState *node, int eflags)
+{
+    TDengineFdwExecState *festate = NULL;
+    EState *estate = node->ss.ps.state;
+    ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+    RangeTblEntry *rte;
+    int numParams;
+    int rtindex;
+    bool schemaless;
+    Oid userid;
+// #ifdef CXX_CLIENT
+    ForeignTable *ftable;
+// #endif
+    List *remote_exprs;
+
+    elog(DEBUG1, "tdengine_fdw : %s", __func__);
+
+    /*
+     * 将私有状态保存在 node->fdw_state 中。
+     */
+    festate = (TDengineFdwExecState *) palloc0(sizeof(TDengineFdwExecState));
+    node->fdw_state = (void *) festate;
+    festate->rowidx = 0;
+
+    /* 保存我们已经有的状态信息 */
+    festate->query = strVal(list_nth(fsplan->fdw_private, 0));
+    festate->retrieved_attrs = list_nth(fsplan->fdw_private, 1);
+    festate->for_update = intVal(list_nth(fsplan->fdw_private, 2)) ? true : false;
+    festate->tlist = (List *) list_nth(fsplan->fdw_private, 3);
+    festate->is_tlist_func_pushdown = intVal(list_nth(fsplan->fdw_private, 4)) ? true : false;
+    schemaless = intVal(list_nth(fsplan->fdw_private, 5)) ? true : false;
+    remote_exprs = (List *) list_nth(fsplan->fdw_private, 6);
+
+    festate->cursor_exists = false;
+
+    if (fsplan->scan.scanrelid > 0)
+        rtindex = fsplan->scan.scanrelid;
+    else
+// #if PG_VERSION_NUM < 160000
+        rtindex = bms_next_member(fsplan->fs_relids, -1);
+// #else
+//         rtindex = bms_next_member(fsplan->fs_base_relids, -1);
+// #endif
+    rte = exec_rt_fetch(rtindex, estate);
+
+// #if PG_VERSION_NUM >= 160000
+//     /*
+//      * 确定以哪个用户身份进行远程访问。这应该与 ExecCheckPermissions() 的操作一致。
+//      */
+//     userid = OidIsValid(fsplan->checkAsUser) ? fsplan->checkAsUser : GetUserId();
+// #else
+    userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+// #endif
+
+    /* 获取选项 */
+    festate->tdengineFdwOptions = tdengine_get_options(rte->relid, userid);
+// #ifdef CXX_CLIENT
+    if (!festate->tdengineFdwOptions->svr_version)
+        festate->tdengineFdwOptions->svr_version = tdengine_get_version_option(festate->tdengineFdwOptions);
+    /* 获取用户映射 */
+    ftable = GetForeignTable(rte->relid);
+    festate->user = GetUserMapping(userid, ftable->serverid);
+// #endif
+
+    tdengine_get_schemaless_info(&(festate->slinfo), schemaless, rte->relid);
+
+    /* 为远程查询中使用的参数的输出转换做准备。 */
+    numParams = list_length(fsplan->fdw_exprs);
+    festate->numParams = numParams;
+    if (numParams > 0)
+    {
+        prepare_query_params((PlanState *) node,
+                             fsplan->fdw_exprs,
+                             remote_exprs,
+                             rte->relid,
+                             numParams,
+                             &festate->param_flinfo,
+                             &festate->param_exprs,
+                             &festate->param_values,
+                             &festate->param_types,
+                             &festate->param_tdengine_types,
+                             &festate->param_tdengine_values,
+                             &festate->param_column_info);
+    }
+}
+
+//======================== IterateForeignScan ==================
+/*
+ * 逐个迭代从 TDengine 获取行，并将其放入元组槽中
+ */
+static TupleTableSlot *
+tdengineIterateForeignScan(ForeignScanState *node)
+{
+    // 获取执行状态
+    TDengineFdwExecState *festate = (TDengineFdwExecState *) node->fdw_state;
+    // 获取元组槽
+    TupleTableSlot *tupleSlot = node->ss.ss_ScanTupleSlot;
+    // 获取执行状态
+    EState	   *estate = node->ss.ps.state;
+    // 获取元组描述符
+    TupleDesc	tupleDescriptor = tupleSlot->tts_tupleDescriptor;
+    // 获取 TDengine 选项
+    tdengine_opt *options;
+    // 存储查询返回结果
+    struct TDengineQuery_return volatile ret;
+    // 存储查询结果
+    struct TDengineResult volatile *result = NULL;
+    // 获取外键扫描计划
+    ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+    // 范围表条目
+    RangeTblEntry *rte;
+    // 范围表索引
+    int			rtindex;
+    // 是否为聚合操作
+    bool		is_agg;
+
+    // 打印调试信息
+    elog(DEBUG1, "tdengine_fdw : %s", __func__);
+
+    /*
+     * 确定以哪个用户身份进行远程访问。这应该与 ExecCheckRTEPerms() 一致。
+     * 在连接或聚合操作的情况下，使用编号最小的成员范围表条目作为代表；
+     * 从任何一个成员范围表条目得到的结果都是相同的。
+     */
+    if (fsplan->scan.scanrelid > 0)
+    {
+        // 如果扫描关系 ID 大于 0，使用该 ID
+        rtindex = fsplan->scan.scanrelid;
+        // 不是聚合操作
+        is_agg = false;
+    }
+    else
+    {
+        // 否则，获取最小的范围表 ID
+        rtindex = bms_next_member(fsplan->fs_relids, -1);
+        // 是聚合操作
+        is_agg = true;
+    }
+    // 获取范围表条目
+    rte = rt_fetch(rtindex, estate->es_range_table);
+
+    // 获取 TDengine 选项
+    options = festate->tdengineFdwOptions;
+
+    /*
+     * 如果这是在 Begin 或 ReScan 之后的第一次调用，我们需要在远程端创建游标。
+     * 绑定参数的操作在这个函数中完成。
+     */
+    if (!festate->cursor_exists)
+        // 创建游标
+        create_cursor(node);
+
+    // 初始化元组槽的值为 0
+    memset(tupleSlot->tts_values, 0, sizeof(Datum) * tupleDescriptor->natts);
+    // 初始化元组槽的空值标记为 true
+    memset(tupleSlot->tts_isnull, true, sizeof(bool) * tupleDescriptor->natts);
+    // 清空元组槽
+    ExecClearTuple(tupleSlot);
+
+    if (festate->rowidx == 0)
+    {
+        // 保存旧的内存上下文
+        MemoryContext oldcontext = NULL;
+
+        // 异常处理开始
+        PG_TRY();
+        {
+            // festate->rows 需要比每行更长的上下文
+            oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+// #ifdef CXX_CLIENT
+            // 使用 C++ 客户端执行查询
+            ret = TDengineQuery(festate->query, festate->user, options,
+// #else
+//             // 使用普通方式执行查询
+//             ret = TDengineQuery(festate->query, options->svr_address, options->svr_port,
+//                                 options->svr_username, options->svr_password,
+//                                 options->svr_database,
+// #endif
+                                festate->param_tdengine_types,
+                                festate->param_tdengine_values,
+                                festate->numParams);
+            if (ret.r1 != NULL)
+            {
+                // 复制错误信息
+                char	   *err = pstrdup(ret.r1);
+                // 释放原错误信息
+                free(ret.r1);
+                ret.r1 = err;
+                // 打印错误信息
+                elog(ERROR, "tdengine_fdw : %s", err);
+            }
+// #ifdef CXX_CLIENT
+            // 使用 C++ 客户端时，ret.r0 是结果集指针
+            result = ret.r0;
+            festate->temp_result = (void *) result;
+// #else
+//             // 普通方式时，获取结果集
+//             result = &ret.r0;
+//             // 复制结果集
+//             copyTDengineResult(festate, result);
+// #endif
+            // 获取结果集的行数
+            festate->row_nums = result->nrow;
+            // 打印查询信息
+            elog(DEBUG1, "tdengine_fdw : query: %s", festate->query);
+
+            // 切换回旧的内存上下文
+            MemoryContextSwitchTo(oldcontext);
+            // 释放结果集
+            TDengineFreeResult((TDengineResult *) result);
+        }
+        // 异常处理捕获部分
+        PG_CATCH();
+        {
+            if (ret.r1 == NULL)
+            {
+                // 释放结果集
+                TDengineFreeResult((TDengineResult *) result);
+            }
+
+            if (oldcontext)
+                // 切换回旧的内存上下文
+                MemoryContextSwitchTo(oldcontext);
+
+            // 重新抛出异常
+            PG_RE_THROW();
+        }
+        // 异常处理结束
+        PG_END_TRY();
+    }
+
+    if (festate->rowidx < festate->row_nums)
+    {
+        // 保存旧的内存上下文
+        MemoryContext oldcontext = NULL;
+
+        // 获取结果集
+        result = (TDengineResult *)festate->temp_result;
+        // 从结果行创建元组
+        make_tuple_from_result_row(&(result->rows[festate->rowidx]),
+                                   (TDengineResult *)result,
+                                   tupleDescriptor,
+                                   tupleSlot->tts_values,
+                                   tupleSlot->tts_isnull,
+                                   rte->relid,
+                                   festate,
+                                   is_agg);
+        // 切换到查询上下文
+        oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+
+        // 释放结果行
+        freeTDengineResultRow(festate, festate->rowidx);
+
+        if (festate->rowidx == (festate->row_nums-1))
+        {
+            // 释放结果集
+            freeTDengineResult(festate);
+        }
+
+        // 切换回旧的内存上下文
+        MemoryContextSwitchTo(oldcontext);
+
+        // 存储虚拟元组
+        ExecStoreVirtualTuple(tupleSlot);
+        // 行索引加 1
+        festate->rowidx++;
+    }
+
+    // 返回元组槽
+    return tupleSlot;
+}
+
+
+//===================== ReScanForeignScan =====================
+/*
+ * 从扫描的起始位置重新开始扫描。请注意，扫描所依赖的任何参数的值可能已经发生变化，
+ * 因此新的扫描不一定会返回与之前完全相同的行。
+ */
+static void
+tdengineReScanForeignScan(ForeignScanState *node)
+{
+
+    TDengineFdwExecState *festate = (TDengineFdwExecState *) node->fdw_state;
+
+    elog(DEBUG1, "tdengine_fdw : %s", __func__);
+
+    festate->cursor_exists = false;
+    festate->rowidx = 0;
+}
+
+//===================== EndForeignScan =======================
+/*
+ * 结束对外部表的扫描，并释放本次扫描所使用的对象
+ */
+static void
+tdengineEndForeignScan(ForeignScanState *node)
+{
+	TDengineFdwExecState *festate = (TDengineFdwExecState *) node->fdw_state;
+
+	elog(DEBUG1, "tdengine_fdw : %s", __func__);
+
+	if (festate != NULL)
+	{
+		festate->cursor_exists = false;
+		festate->rowidx = 0;
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
