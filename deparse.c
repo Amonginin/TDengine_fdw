@@ -1,5081 +1,2351 @@
-/*-------------------------------------------------------------------------
+#include "postgres.h"
+#include "tdengine_fdw.h"
+
+#include "access/htup_details.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_operator.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/parsenodes.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
+#include "utils/timestamp.h"
+
+// TODO: 查文档看具体支持的函数
+/* List of stable function with star argument of TDengine */
+static const char *TDengineStableStarFunction[] = {
+	"influx_count_all",
+	"influx_mode_all",
+	"influx_max_all",
+	"influx_min_all",
+	"influx_sum_all",
+	"integral_all",
+	"mean_all",
+	"median_all",
+	"spread_all",
+	"stddev_all",
+	"first_all",
+	"last_all",
+	"percentile_all",
+	"sample_all",
+	"abs_all",
+	"acos_all",
+	"asin_all",
+	"atan_all",
+	"atan2_all",
+	"ceil_all",
+	"cos_all",
+	"cumulative_sum_all",
+	"derivative_all",
+	"difference_all",
+	"elapsed_all",
+	"exp_all",
+	"floor_all",
+	"ln_all",
+	"log_all",
+	"log2_all",
+	"log10_all",
+	"moving_average_all",
+	"non_negative_derivative_all",
+	"non_negative_difference_all",
+	"pow_all",
+	"round_all",
+	"sin_all",
+	"sqrt_all",
+	"tan_all",
+	"chande_momentum_oscillator_all",
+	"exponential_moving_average_all",
+	"double_exponential_moving_average_all",
+	"kaufmans_efficiency_ratio_all",
+	"kaufmans_adaptive_moving_average_all",
+	"triple_exponential_moving_average_all",
+	"triple_exponential_derivative_all",
+	"relative_strength_index_all",
+	NULL};
+
+/* List of unique function without star argument of TDengine */
+static const char *TDengineUniqueFunction[] = {
+	"bottom",
+	"percentile",
+	"top",
+	"cumulative_sum",
+	"derivative",
+	"difference",
+	"elapsed",
+	"log2",
+	"log10", /* Use for PostgreSQL old version */
+	"moving_average",
+	"non_negative_derivative",
+	"non_negative_difference",
+	"holt_winters",
+	"holt_winters_with_fit",
+	"chande_momentum_oscillator",
+	"exponential_moving_average",
+	"double_exponential_moving_average",
+	"kaufmans_efficiency_ratio",
+	"kaufmans_adaptive_moving_average",
+	"triple_exponential_moving_average",
+	"triple_exponential_derivative",
+	"relative_strength_index",
+	"influx_count",
+	"integral",
+	"spread",
+	"first",
+	"last",
+	"sample",
+	"influx_time",
+	"influx_fill_numeric",
+	"influx_fill_option",
+	NULL};
+
+/* List of supported builtin function of TDengine */
+static const char *TDengineSupportedBuiltinFunction[] = {
+	"now",
+	"sqrt",
+	"abs",
+	"acos",
+	"asin",
+	"atan",
+	"atan2",
+	"ceil",
+	"cos",
+	"exp",
+	"floor",
+	"ln",
+	"log",
+	"log10",
+	"pow",
+	"round",
+	"sin",
+	"tan",
+	NULL};
+
+/*
+ * foreign_glob_cxt: 表达式树遍历的全局上下文结构
  *
- * InfluxDB Foreign Data Wrapper for PostgreSQL
+ * 成员说明:
+ *   @root: 全局计划器状态
+ *   @foreignrel: 当前正在规划的外部关系
+ *   @relids: 底层扫描中基础关系的relids（是一个bitmap）
+ *   @relid: 关系OID
+ *   @mixing_aggref_status: 标记表达式是否同时包含聚合和非聚合元素
+ *   @for_tlist: 是否为目标列表表达式求值
+ *   @is_inner_func: 是否存在于内部表达式中
  *
- * Portions Copyright (c) 2018, TOSHIBA CORPORATION
- *
- * IDENTIFICATION
- *        deparse.c
- *
- *-------------------------------------------------------------------------
+ * 使用场景:
+ *   用于tdengine_foreign_expr_walker遍历表达式树时的全局状态保持
  */
+typedef struct foreign_glob_cxt
+{
+	PlannerInfo *root;
+	RelOptInfo *foreignrel;
+	Relids relids;
+	Oid relid;
+	unsigned int mixing_aggref_status;
+	bool for_tlist;
+	bool is_inner_func;
+} foreign_glob_cxt;
 
- #include "postgres.h"
+/*
+ * FDWCollateState: 排序规则状态枚举
+ *
+ * 枚举值说明:
+ *   FDW_COLLATE_NONE - 表达式属于不可排序类型
+ *   FDW_COLLATE_SAFE - 排序规则来自外部变量
+ *   FDW_COLLATE_UNSAFE - 排序规则来自其他来源
+ *
+ * 使用场景:
+ *   用于标记表达式中排序规则的来源安全性
+ */
+typedef enum
+{
+	FDW_COLLATE_NONE,
+	FDW_COLLATE_SAFE,
+	FDW_COLLATE_UNSAFE,
+} FDWCollateState;
 
- #include "tdengine_fdw.h"
- 
- #include "pgtime.h"
- #include "access/heapam.h"
- #include "access/htup_details.h"
- #include "access/sysattr.h"
- #include "catalog/pg_aggregate.h"
- #include "catalog/pg_authid.h"
- #include "catalog/pg_collation.h"
- #include "catalog/pg_namespace.h"
- #include "catalog/pg_operator.h"
- #include "catalog/pg_proc.h"
- #include "catalog/pg_ts_config.h"
- #include "catalog/pg_ts_dict.h"
- #include "catalog/pg_type.h"
- #include "commands/defrem.h"
- #include "miscadmin.h"
- #include "nodes/nodeFuncs.h"
- #include "nodes/plannodes.h"
- #include "optimizer/clauses.h"
- #include "optimizer/tlist.h"
- #include "parser/parsetree.h"
- #include "utils/builtins.h"
- #include "utils/lsyscache.h"
- #include "utils/syscache.h"
- #include "utils/timestamp.h"
- #include "utils/typcache.h"
- #include "sys/types.h"
- #include "regex.h"
- #define QUOTE '"'
- 
- /* List of stable function with star argument of InfluxDB */
- static const char *InfluxDBStableStarFunction[] = {
-     "influx_count_all",
-     "influx_mode_all",
-     "influx_max_all",
-     "influx_min_all",
-     "influx_sum_all",
-     "integral_all",
-     "mean_all",
-     "median_all",
-     "spread_all",
-     "stddev_all",
-     "first_all",
-     "last_all",
-     "percentile_all",
-     "sample_all",
-     "abs_all",
-     "acos_all",
-     "asin_all",
-     "atan_all",
-     "atan2_all",
-     "ceil_all",
-     "cos_all",
-     "cumulative_sum_all",
-     "derivative_all",
-     "difference_all",
-     "elapsed_all",
-     "exp_all",
-     "floor_all",
-     "ln_all",
-     "log_all",
-     "log2_all",
-     "log10_all",
-     "moving_average_all",
-     "non_negative_derivative_all",
-     "non_negative_difference_all",
-     "pow_all",
-     "round_all",
-     "sin_all",
-     "sqrt_all",
-     "tan_all",
-     "chande_momentum_oscillator_all",
-     "exponential_moving_average_all",
-     "double_exponential_moving_average_all",
-     "kaufmans_efficiency_ratio_all",
-     "kaufmans_adaptive_moving_average_all",
-     "triple_exponential_moving_average_all",
-     "triple_exponential_derivative_all",
-     "relative_strength_index_all",
- NULL};
- 
- /* List of unique function without star argument of InfluxDB */
- static const char *InfluxDBUniqueFunction[] = {
-     "bottom",
-     "percentile",
-     "top",
-     "cumulative_sum",
-     "derivative",
-     "difference",
-     "elapsed",
-     "log2",
-     "log10",					/* Use for PostgreSQL old version */
-     "moving_average",
-     "non_negative_derivative",
-     "non_negative_difference",
-     "holt_winters",
-     "holt_winters_with_fit",
-     "chande_momentum_oscillator",
-     "exponential_moving_average",
-     "double_exponential_moving_average",
-     "kaufmans_efficiency_ratio",
-     "kaufmans_adaptive_moving_average",
-     "triple_exponential_moving_average",
-     "triple_exponential_derivative",
-     "relative_strength_index",
-     "influx_count",
-     "integral",
-     "spread",
-     "first",
-     "last",
-     "sample",
-     "influx_time",
-     "influx_fill_numeric",
-     "influx_fill_option",
- NULL};
- 
- /* List of supported builtin function of InfluxDB */
- static const char *InfluxDBSupportedBuiltinFunction[] = {
-     "now",
-     "sqrt",
-     "abs",
-     "acos",
-     "asin",
-     "atan",
-     "atan2",
-     "ceil",
-     "cos",
-     "exp",
-     "floor",
-     "ln",
-     "log",
-     "log10",
-     "pow",
-     "round",
-     "sin",
-     "tan",
- NULL};
- 
- /*
-  * Global context for tdengine_foreign_expr_walker's search of an expression tree.
-  */
- typedef struct foreign_glob_cxt
- {
-     PlannerInfo *root;			/* global planner state */
-     RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
-     Relids		relids;			/* relids of base relations in the underlying
-                                  * scan */
-     Oid			relid;			/* relation oid */
-     unsigned int mixing_aggref_status;	/* mixing_aggref_status contains
-                                          * information about whether
-                                          * expression includes both of
-                                          * aggregate and non-aggregate. */
-     bool		for_tlist;		/* whether evaluation for the expression of
-                                  * tlist */
-     bool		is_inner_func;	/* exist or not in inner exprs */
- } foreign_glob_cxt;
- 
- /*
-  * Local (per-tree-level) context for tdengine_foreign_expr_walker's search.
-  * This is concerned with identifying collations used in the expression.
-  */
- typedef enum
- {
-     FDW_COLLATE_NONE,			/* expression is of a noncollatable type */
-     FDW_COLLATE_SAFE,			/* collation derives from a foreign Var */
-     FDW_COLLATE_UNSAFE,			/* collation derives from something else */
- } FDWCollateState;
- 
- typedef struct foreign_loc_cxt
- {
-     Oid			collation;		/* OID of current collation, if any */
-     FDWCollateState state;		/* state of current collation choice */
-     bool		can_skip_cast;	/* outer function can skip float8/numeric cast */
-     bool		can_pushdown_stable;	/* true if query contains stable
-                                          * function with star or regex */
-     bool		can_pushdown_volatile;	/* true if query contains volatile
-                                          * function */
-     bool		influx_fill_enable; /* true if deparse subexpression inside
-                                      * influx_time() */
-     bool		have_otherfunc_influx_time_tlist; /* true if having other functions than influx_time() in tlist. */
-     bool		has_time_key;			/* mark true if comparison with time key column */
-     bool		has_sub_or_add_operator; 	/* mark true if expression has '-' or '+' operator */
-     bool		is_comparison;				/* mark true if has comparison */
- } foreign_loc_cxt;
- 
- /* Type of operator for pattern matching */
- typedef enum
- {
-     UNKNOWN_OPERATOR = 0,
-     LIKE_OPERATOR,                       /* LIKE case senstive */
-     NOT_LIKE_OPERATOR,                   /* NOT LIKE case sensitive */
-     ILIKE_OPERATOR,                      /* LIKE case insensitive */
-     NOT_ILIKE_OPERATOR,                  /* NOT LIKE case insensitive */
-     REGEX_MATCH_CASE_SENSITIVE_OPERATOR,
-     REGEX_NOT_MATCH_CASE_SENSITIVE_OPERATOR,
-     REGEX_MATCH_CASE_INSENSITIVE_OPERATOR,
-     REGEX_NOT_MATCH_CASE_INSENSITIVE_OPERATOR
- } PatternMatchingOperator;
- 
- /*
-  * Context for tdengine_deparse_expr
-  */
- typedef struct deparse_expr_cxt
- {
-     PlannerInfo *root;			/* global planner state */
-     RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
-     RelOptInfo *scanrel;		/* the underlying scan relation. Same as
-                                  * foreignrel, when that represents a join or
-                                  * a base relation. */
-     StringInfo	buf;			/* output buffer to append to */
-     List	  **params_list;	/* exprs that will become remote Params */
-     PatternMatchingOperator	op_type;	/* Type of operator for pattern matching */
-     bool		is_tlist;		/* deparse during target list exprs */
-     bool		can_skip_cast;	/* outer function can skip float8/numeric cast */
-     bool		can_delete_directly;	/* DELETE statement can pushdown
-                                          * directly */
-     bool        has_bool_cmp;   /* outer has bool comparison target */
-     FuncExpr   *influx_fill_expr;	/* Store the fill() function */
- 
-     /*
-      * For comparison with time key column, if its data type is timestamp with time zone,
-      * need to convert to timestamp without time zone.
-      */
-     bool        convert_to_timestamp;
- } deparse_expr_cxt;
- 
- typedef struct pull_func_clause_context
- {
-     List	   *funclist;
- }			pull_func_clause_context;
- 
- /*
-  * Functions to determine whether an expression can be evaluated safely on
-  * remote server.
-  */
- static bool tdengine_foreign_expr_walker(Node *node,
-                                          foreign_glob_cxt *glob_cxt,
-                                          foreign_loc_cxt *outer_cxt);
- 
- /*
-  * Functions to construct string representation of a node tree.
-  */
- static void tdengine_deparse_expr(Expr *node, deparse_expr_cxt *context);
- static void tdengine_deparse_var(Var *node, deparse_expr_cxt *context);
- static void tdengine_deparse_const(Const *node, deparse_expr_cxt *context, int showtype);
- static void tdengine_deparse_param(Param *node, deparse_expr_cxt *context);
- static void tdengine_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context);
- static void tdengine_deparse_fill_option(StringInfo buf, const char *val);
- static void tdengine_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context);
- static void tdengine_deparse_operator_name(StringInfo buf, Form_pg_operator opform, PatternMatchingOperator *op_type);
- 
- static void tdengine_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node,
-                                                   deparse_expr_cxt *context);
- static void tdengine_deparse_relabel_type(RelabelType *node, deparse_expr_cxt *context);
- static void tdengine_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context);
- static void tdengine_deparse_null_test(NullTest *node, deparse_expr_cxt *context);
- static void tdengine_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context);
- static void tdengine_deparse_coerce_via_io(CoerceViaIO * cio, deparse_expr_cxt *context);
- static void tdengine_print_remote_param(int paramindex, Oid paramtype, int32 paramtypmod,
-                                         deparse_expr_cxt *context);
- static void tdengine_print_remote_placeholder(Oid paramtype, int32 paramtypmod,
-                                               deparse_expr_cxt *context);
- static void tdengine_deparse_relation(StringInfo buf, Relation rel);
- static void tdengine_deparse_target_list(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel,
-                                          Bitmapset *attrs_used, List **retrieved_attrs);
- static void tdengine_deparse_target_list_schemaless(StringInfo buf, Relation rel, Oid reloid,
-                                                     Bitmapset *attrs_used,
-                                                     List **retrieved_attrs,
-                                                     bool all_fieldtag, List *slcols);
- static void tdengine_deparse_slvar(Node *node, Var *var, Const *cnst, deparse_expr_cxt *context);
- static void tdengine_deparse_column_ref(StringInfo buf, int varno, int varattno, Oid vartype, PlannerInfo *root, bool convert, bool *can_delete_directly);
- static void tdengine_deparse_select(List *tlist, List **retrieved_attrs, deparse_expr_cxt *context);
- static void tdengine_deparse_from_expr_for_rel(StringInfo buf, PlannerInfo *root,
-                                                RelOptInfo *foreignrel,
-                                                bool use_alias, List **params_list);
- static void tdengine_deparse_from_expr(List *quals, deparse_expr_cxt *context);
- static void tdengine_deparse_aggref(Aggref *node, deparse_expr_cxt *context);
- static void tdengine_append_conditions(List *exprs, deparse_expr_cxt *context);
- static void tdengine_append_group_by_clause(List *tlist, deparse_expr_cxt *context);
- 
- static void tdengine_append_order_by_clause(List *pathkeys, deparse_expr_cxt *context);
- static Node *tdengine_deparse_sort_group_clause(Index ref, List *tlist,
-                                                 deparse_expr_cxt *context);
- static void tdengine_deparse_explicit_target_list(List *tlist, List **retrieved_attrs,
-                                                   deparse_expr_cxt *context);
- static Expr *tdengine_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
- static bool tdengine_contain_time_column(List *exprs, schemaless_info *pslinfo);
- static bool tdengine_contain_time_key_column(Oid relid, List *exprs);
- static bool tdengine_contain_time_expr(List *exprs);
- static bool tdengine_contain_time_function(List *exprs);
- static bool tdengine_contain_time_param(List *exprs);
- static bool tdengine_contain_time_const(List *exprs);
- static void tdengine_append_field_key(TupleDesc tupdesc, StringInfo buf, Index rtindex, PlannerInfo *root, bool first);
- static void tdengine_append_limit_clause(deparse_expr_cxt *context);
- static bool tdengine_is_string_type(Node *node, schemaless_info *pslinfo);
- static char *tdengine_quote_identifier(const char *s, char q);
- static bool tdengine_contain_functions_walker(Node *node, void *context);
- 
- bool		tdengine_is_grouping_target(TargetEntry *tle, Query *query);
- bool		tdengine_is_builtin(Oid objectId);
- bool		tdengine_is_regex_argument(Const *node, char **extval);
- char	   *tdengine_replace_function(char *in);
- bool		tdengine_is_star_func(Oid funcid, char *in);
- static bool tdengine_is_unique_func(Oid funcid, char *in);
- static bool tdengine_is_supported_builtin_func(Oid funcid, char *in);
- static bool exist_in_function_list(char *funcname, const char **funclist);
- static void add_backslash(StringInfo buf, const char *ptr, const char *regex_special);
- static bool tdengine_last_percent_sign_check(const char *val);
- static void tdengine_deparse_string_like_pattern(StringInfo buf, const char *val, PatternMatchingOperator op_type);
- static void tdengine_deparse_string_regex_pattern(StringInfo buf, const char *val, PatternMatchingOperator op_type);
- 
- /*
-  * Local variables.
-  */
- static char *cur_opname = NULL;
- 
- /*
-  * Append remote name of specified foreign table to buf.
-  * Use value of table_name FDW option (if any) instead of relation's name.
-  * Similarly, schema_name FDW option overrides schema name.
-  */
- static void
- tdengine_deparse_relation(StringInfo buf, Relation rel)
- {
-     char	   *relname = tdengine_get_table_name(rel);
- 
-     appendStringInfo(buf, "%s", tdengine_quote_identifier(relname, QUOTE));
- }
- 
- static char *
- tdengine_quote_identifier(const char *s, char q)
- {
-     char	   *result = palloc(strlen(s) * 2 + 3);
-     char	   *r = result;
- 
-     *r++ = q;
-     while (*s)
-     {
-         if (*s == q)
-             *r++ = *s;
-         *r++ = *s;
-         s++;
-     }
-     *r++ = q;
-     *r++ = '\0';
-     return result;
- }
- 
- /*
-  * pull_func_clause_walker
-  *
-  * Recursively search for functions within a clause.
-  */
- static bool
- tdengine_pull_func_clause_walker(Node *node, pull_func_clause_context * context)
- {
-     if (node == NULL)
-         return false;
-     if (IsA(node, FuncExpr))
-     {
-         context->funclist = lappend(context->funclist, node);
-         return false;
-     }
- 
-     return expression_tree_walker(node, tdengine_pull_func_clause_walker,
-                                   (void *) context);
- }
- 
- /*
-  * pull_func_clause
-  *
-  * Pull out function from a clause and then add to target list
-  */
- List *
- tdengine_pull_func_clause(Node *node)
- {
-     pull_func_clause_context context;
- 
-     context.funclist = NIL;
- 
-     tdengine_pull_func_clause_walker(node, &context);
- 
-     return context.funclist;
- }
- 
- /*
-  * Returns true if given expr is safe to evaluate on the foreign server.
-  */
- bool
- tdengine_is_foreign_expr(PlannerInfo *root,
-                          RelOptInfo *baserel,
-                          Expr *expr,
-                          bool for_tlist)
- {
-     foreign_glob_cxt glob_cxt;
-     foreign_loc_cxt loc_cxt;
-     InfluxDBFdwRelationInfo *fpinfo = (InfluxDBFdwRelationInfo *) (baserel->fdw_private);
- 
-     /*
-      * Check that the expression consists of nodes that are safe to execute
-      * remotely.
-      */
-     glob_cxt.root = root;
-     glob_cxt.foreignrel = baserel;
-     glob_cxt.relid = fpinfo->table->relid;
-     glob_cxt.mixing_aggref_status = INFLUXDB_TARGETS_MIXING_AGGREF_SAFE;
-     glob_cxt.for_tlist = for_tlist;
-     glob_cxt.is_inner_func = false;
- 
-     /*
-      * For an upper relation, use relids from its underneath scan relation,
-      * because the upperrel's own relids currently aren't set to anything
-      * meaningful by the core code.  For other relation, use their own relids.
-      */
-     if (baserel->reloptkind == RELOPT_UPPER_REL)
-         glob_cxt.relids = fpinfo->outerrel->relids;
-     else
-         glob_cxt.relids = baserel->relids;
-     loc_cxt.collation = InvalidOid;
-     loc_cxt.state = FDW_COLLATE_NONE;
-     loc_cxt.can_skip_cast = false;
-     loc_cxt.influx_fill_enable = false;
-     loc_cxt.has_time_key = false;
-     loc_cxt.has_sub_or_add_operator = false;
-     loc_cxt.is_comparison = false;
-     if (!tdengine_foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
-         return false;
- 
-     /*
-      * If the expression has a valid collation that does not arise from a
-      * foreign var, the expression can not be sent over.
-      */
-     if (loc_cxt.state == FDW_COLLATE_UNSAFE)
-         return false;
- 
-     /* OK to evaluate on the remote server */
-     return true;
- }
- 
- static bool
- is_valid_type(Oid type)
- {
-     switch (type)
-     {
-         case INT2OID:
-         case INT4OID:
-         case INT8OID:
-         case OIDOID:
-         case FLOAT4OID:
-         case FLOAT8OID:
-         case NUMERICOID:
-         case VARCHAROID:
-         case TEXTOID:
-         case TIMEOID:
-         case TIMESTAMPOID:
-         case TIMESTAMPTZOID:
-             return true;
-     }
-     return false;
- }
- 
- /*
-  * Check if expression is safe to execute remotely, and return true if so.
-  *
-  * In addition, *outer_cxt is updated with collation information.
-  *
-  * We must check that the expression contains only node types we can deparse,
-  * that all types/functions/operators are safe to send (which we approximate
-  * as being built-in), and that all collations used in the expression derive
-  * from Vars of the foreign table.  Because of the latter, the logic is
-  * pretty close to assign_collations_walker() in parse_collate.c, though we
-  * can assume here that the given expression is valid.
-  */
- static bool
- tdengine_foreign_expr_walker(Node *node,
-                              foreign_glob_cxt *glob_cxt,
-                              foreign_loc_cxt *outer_cxt)
- {
-     bool		check_type = true;
-     foreign_loc_cxt inner_cxt;
-     Oid			collation;
-     FDWCollateState state;
-     HeapTuple	tuple;
-     Form_pg_operator form;
-     char	   *cur_opname;
-     static bool is_time_column = false; /* Use static variable for save value
-                                          * from child node to parent node.
-                                          * Check column T_Var is time column? */
-     InfluxDBFdwRelationInfo *fpinfo =
-         (InfluxDBFdwRelationInfo *)(glob_cxt->foreignrel->fdw_private);
- 
-     /* Need do nothing for empty subexpressions */
-     if (node == NULL)
-         return true;
- 
-     /* Set up inner_cxt for possible recursion to child nodes */
-     inner_cxt.collation = InvalidOid;
-     inner_cxt.state = FDW_COLLATE_NONE;
-     inner_cxt.can_skip_cast = false;
-     inner_cxt.can_pushdown_stable = false;
-     inner_cxt.can_pushdown_volatile = false;
-     inner_cxt.influx_fill_enable = false;
-     inner_cxt.has_time_key = false;
-     inner_cxt.has_sub_or_add_operator = false;
-     inner_cxt.is_comparison = false;
-     switch (nodeTag(node))
-     {
-         case T_Var:
-             {
-                 Var		   *var = (Var *) node;
- 
-                 /*
-                  * If the Var is from the foreign table, we consider its
-                  * collation (if any) safe to use.  If it is from another
-                  * table, we treat its collation the same way as we would a
-                  * Param's collation, ie it's not safe for it to have a
-                  * non-default collation.
-                  */
-                 if (bms_is_member(var->varno, glob_cxt->relids) &&
-                     var->varlevelsup == 0)
-                 {
-                     /* Var belongs to foreign table */
- 
-                     if (var->varattno < 0)
-                         return false;
- 
-                     /* check column is time column? */
-                     if (INFLUXDB_IS_TIME_TYPE(var->vartype))
-                     {
-                         is_time_column = true;
- 
-                         /*
-                          * Does not pushdown comparison between substraction or addition of time column with interval and time key
-                          * For example:
-                          *	time key = time column +/- interval
-                          */
-                         if (outer_cxt->is_comparison && outer_cxt->has_sub_or_add_operator && outer_cxt->has_time_key)
-                             return false;
-                     }
- 
-                     /* Mark this target is field/tag */
-                     glob_cxt->mixing_aggref_status |= INFLUXDB_TARGETS_MARK_COLUMN;
- 
-                     /* Else check the collation */
-                     collation = var->varcollid;
-                     state = OidIsValid(collation) ? FDW_COLLATE_SAFE : FDW_COLLATE_NONE;
-                 }
-                 else
-                 {
-                     /* Var belongs to some other table */
-                     collation = var->varcollid;
-                     if (collation == InvalidOid ||
-                         collation == DEFAULT_COLLATION_OID)
-                     {
-                         /*
-                          * It's noncollatable, or it's safe to combine with a
-                          * collatable foreign Var, so set state to NONE.
-                          */
-                         state = FDW_COLLATE_NONE;
-                     }
-                     else
-                     {
-                         /*
-                          * Do not fail right away, since the Var might appear
-                          * in a collation-insensitive context.
-                          */
-                         state = FDW_COLLATE_UNSAFE;
-                     }
-                 }
-             }
-             break;
-         case T_Const:
-             {
-                 char	   *type_name;
-                 Const	   *c = (Const *) node;
- 
-                 if (c->consttype == INTERVALOID)
-                 {
-                     Interval   *interval = DatumGetIntervalP(c->constvalue);
- #if (PG_VERSION_NUM >= 150000)
-                     struct pg_itm tm;
-                     interval2itm(*interval, &tm);
- #else	
-                     struct pg_tm tm;
-                     fsec_t		fsec;
- 
-                     interval2tm(*interval, &tm, &fsec);
- #endif
- 
-                     /*
-                      * Not pushdown interval with month or year because
-                      * InfluxDB does not support month and year duration
-                      */
-                     if (tm.tm_mon != 0 || tm.tm_year != 0)
-                     {
-                         return false;
-                     }
-                 }
- 
-                 /*
-                  * Get type name based on the const value. If the type name is
-                  * "influx_fill_enum", allow it to push down to remote by
-                  * disable build in type check
-                  */
-                 type_name = tdengine_get_data_type_name(c->consttype);
-                 if (strcmp(type_name, "influx_fill_enum") == 0)
-                     check_type = false;
- 
-                 /*
-                  * If the constant has nondefault collation, either it's of a
-                  * non-builtin type, or it reflects folding of a CollateExpr;
-                  * either way, it's unsafe to send to the remote.
-                  */
-                 if (c->constcollid != InvalidOid &&
-                     c->constcollid != DEFAULT_COLLATION_OID)
-                     return false;
- 
-                 /* Otherwise, we can consider that it doesn't set collation */
-                 collation = InvalidOid;
-                 state = FDW_COLLATE_NONE;
-             }
-             break;
-         case T_Param:
-             {
-                 Param	   *p = (Param *) node;
- 
-                 if (!is_valid_type(p->paramtype))
-                     return false;
- 
-                 if (INFLUXDB_IS_TIME_TYPE(p->paramtype))
-                 {
-                     /*
-                      * Does not pushdown comparison between substraction or addition of Param with interval and time key
-                      * For example:
-                      *	time key = Param +/- interval
-                      */
-                     if (outer_cxt->is_comparison && outer_cxt->has_sub_or_add_operator && outer_cxt->has_time_key)
-                         return false;
-                 }
- 
-                 /*
-                  * Collation rule is same as for Consts and non-foreign Vars.
-                  */
-                 collation = p->paramcollid;
-                 if (collation == InvalidOid ||
-                     collation == DEFAULT_COLLATION_OID)
-                     state = FDW_COLLATE_NONE;
-                 else
-                     state = FDW_COLLATE_UNSAFE;
-             }
-             break;
-         case T_FieldSelect:		/* Allow pushdown FieldSelect to support
-                                  * accessing value of record of star and regex
-                                  * functions */
-             {
-                 if (!(glob_cxt->foreignrel->reloptkind == RELOPT_BASEREL ||
-                       glob_cxt->foreignrel->reloptkind == RELOPT_OTHER_MEMBER_REL))
-                     return false;
- 
-                 collation = InvalidOid;
-                 state = FDW_COLLATE_NONE;
-                 check_type = false;
-             }
-             break;
-         case T_FuncExpr:
-             {
- 
-                 FuncExpr   *fe = (FuncExpr *) node;
-                 char	   *opername = NULL;
-                 bool		is_cast_func = false;
-                 bool		is_star_func = false;
-                 bool		can_pushdown_func = false;
-                 bool		is_regex = false;
- 
-                 /* get function name and schema */
-                 tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(fe->funcid));
-                 if (!HeapTupleIsValid(tuple))
-                 {
-                     elog(ERROR, "cache lookup failed for function %u", fe->funcid);
-                 }
-                 opername = pstrdup(((Form_pg_proc) GETSTRUCT(tuple))->proname.data);
-                 ReleaseSysCache(tuple);
- 
-                 if (INFLUXDB_IS_TIME_TYPE(fe->funcresulttype))
-                 {
-                     if (outer_cxt->is_comparison)
-                     {
-                         if (strcmp(opername, "now") != 0)	/* Does not support comparison with function except now()*/
-                         {
-                             return false;
-                         }
-                         else if (!outer_cxt->has_time_key)	/* Does not support comparison between now() and not time key (tags/fields column or time expression) */
-                         {
-                             return false;
-                         }
-                     }
-                 }
- 
-                 if (strcmp(opername, "float8") == 0 || strcmp(opername, "numeric") == 0)
-                 {
-                     is_cast_func = true;
-                 }
- 
-                 /* pushed down to InfluxDB */
-                 if (tdengine_is_star_func(fe->funcid, opername))
-                 {
-                     is_star_func = true;
-                     outer_cxt->can_pushdown_stable = true;
-                 }
- 
-                 if (tdengine_is_unique_func(fe->funcid, opername) ||
-                     tdengine_is_supported_builtin_func(fe->funcid, opername))
-                 {
-                     can_pushdown_func = true;
-                     inner_cxt.can_skip_cast = true;
-                     outer_cxt->can_pushdown_volatile = true;
-                 }
- 
-                 if (!(is_star_func || can_pushdown_func || is_cast_func))
-                     return false;
- 
-                 /* fill() must be inside influx_time() */
-                 if (strcmp(opername, "influx_fill_numeric") == 0 ||
-                     strcmp(opername, "influx_fill_option") == 0)
-                 {
-                     if (outer_cxt->influx_fill_enable == false)
-                         elog(ERROR, "tdengine_fdw: syntax error influx_fill_numeric() or influx_fill_option() must be embedded inside influx_time() function\n");
-                 }
- 
-                 /* Accept type cast functions if outer is specific functions */
-                 if (is_cast_func)
-                 {
-                     if (outer_cxt->can_skip_cast == false)
-                         return false;
-                 }
-                 else
-                 {
-                     /*
-                      * Nested function cannot be executed in non tlist
-                      */
-                     if (!glob_cxt->for_tlist && glob_cxt->is_inner_func)
-                         return false;
- 
-                     glob_cxt->is_inner_func = true;
-                 }
- 
-                 /*
-                  * Allow influx_fill_numeric/influx_fill_option() inside
-                  * influx_time() function
-                  */
-                 if (strcmp(opername, "influx_time") == 0)
-                 {
-                     inner_cxt.influx_fill_enable = true;
-                 }
-                 else
-                 {
-                     /* There is another function than influx_time in tlist */
-                     outer_cxt->have_otherfunc_influx_time_tlist = true;
-                 }
- 
-                 /*
-                  * Recurse to input subexpressions.
-                  */
-                 if (!tdengine_foreign_expr_walker((Node *) fe->args,
-                                                   glob_cxt, &inner_cxt))
-                     return false;
- 
-                 /*
-                  * Force to restore the state after deparse subexpression if
-                  * it has been change above
-                  */
-                 inner_cxt.influx_fill_enable = false;
- 
-                 if (!is_cast_func)
-                     glob_cxt->is_inner_func = false;
- 
-                 if (list_length(fe->args) > 0)
-                 {
-                     ListCell   *funclc;
-                     Node	   *firstArg;
- 
-                     funclc = list_head(fe->args);
-                     firstArg = (Node *) lfirst(funclc);
- 
-                     if (IsA(firstArg, Const))
-                     {
-                         Const	   *arg = (Const *) firstArg;
-                         char	   *extval;
- 
-                         if (arg->consttype == TEXTOID)
-                             is_regex = tdengine_is_regex_argument(arg, &extval);
-                     }
-                 }
- 
-                 if (is_regex)
-                 {
-                     collation = InvalidOid;
-                     state = FDW_COLLATE_NONE;
-                     check_type = false;
-                     outer_cxt->can_pushdown_stable = true;
-                 }
-                 else
-                 {
-                     /*
-                      * If function's input collation is not derived from a
-                      * foreign Var, it can't be sent to remote.
-                      */
-                     if (fe->inputcollid == InvalidOid)
-                          /* OK, inputs are all noncollatable */ ;
-                     else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-                              fe->inputcollid != inner_cxt.collation)
-                         return false;
- 
-                     /*
-                      * Detect whether node is introducing a collation not
-                      * derived from a foreign Var.  (If so, we just mark it
-                      * unsafe for now rather than immediately returning false,
-                      * since the parent node might not care.)
-                      */
-                     collation = fe->funccollid;
-                     if (collation == InvalidOid)
-                         state = FDW_COLLATE_NONE;
-                     else if (inner_cxt.state == FDW_COLLATE_SAFE &&
-                              collation == inner_cxt.collation)
-                         state = FDW_COLLATE_SAFE;
-                     else if (collation == DEFAULT_COLLATION_OID)
-                         state = FDW_COLLATE_NONE;
-                     else
-                         state = FDW_COLLATE_UNSAFE;
-                 }
-             }
-             break;
-         case T_OpExpr:
-             {
-                 OpExpr	   *oe = (OpExpr *) node;
-                 bool		is_slvar = false;
-                 bool		is_param = false;
-                 bool		has_time_key = false;
-                 bool		has_time_column = false;
-                 bool		has_time_tags_or_fields_column = false;
- 
-                 if (tdengine_is_slvar_fetch(node, &(fpinfo->slinfo)))
-                     is_slvar = true;
- 
-                 if (tdengine_is_param_fetch(node, &(fpinfo->slinfo)))
-                     is_param = true;
- 
-                 /*
-                  * Similarly, only built-in operators can be sent to remote.
-                  * (If the operator is, surely its underlying function is
-                  * too.)
-                  */
-                 if (!tdengine_is_builtin(oe->opno) && !is_slvar && !is_param)
-                     return false;
- 
-                 tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(oe->opno));
-                 if (!HeapTupleIsValid(tuple))
-                     elog(ERROR, "cache lookup failed for operator %u", oe->opno);
-                 form = (Form_pg_operator) GETSTRUCT(tuple);
- 
-                 /* opname is not a SQL identifier, so we should not quote it. */
-                 cur_opname = pstrdup(NameStr(form->oprname));
-                 ReleaseSysCache(tuple);
- 
-                 if (strcmp(cur_opname, "=") == 0 ||
-                     strcmp(cur_opname, ">") == 0 ||
-                     strcmp(cur_opname, "<") == 0 ||
-                     strcmp(cur_opname, ">=") == 0 ||
-                     strcmp(cur_opname, "<=") == 0 ||
-                     strcmp(cur_opname, "!=") == 0 ||
-                     strcmp(cur_opname, "<>") == 0)
-                 {
-                     inner_cxt.is_comparison = true;
-                 }
- 
-                 /*
-                  * Does not pushdown time comparison between interval vs interval
-                  * For example:
-                  *	(time - time) vs interval constant
-                  *	(time - time) vs (time - time)
-                  */
-                 if (inner_cxt.is_comparison &&
-                     exprType((Node*) linitial(oe->args)) == INTERVALOID &&
-                     exprType((Node*) lsecond(oe->args)) == INTERVALOID)
-                 {
-                     return false;
-                 }
- 
-                 has_time_key = tdengine_contain_time_key_column(glob_cxt->relid, oe->args);
- 
-                 /*
-                  * Does not pushdown time comparison between time expression vs not time key
-                  * For example:
-                  *	time +/- interval vs tags/fields column
-                  *	time +/- interval vs time +/- interval
-                  *	time +/- interval vs function
-                  */
-                 if (inner_cxt.is_comparison &&
-                     !has_time_key &&
-                     tdengine_contain_time_expr(oe->args))
-                 {
-                     return false;
-                 }
- 
-                 /*
-                  * Does not pushdown comparsion using !=, <> with time key column.
-                  */
-                 if (strcmp(cur_opname, "!=") == 0 ||
-                     strcmp(cur_opname, "<>") == 0)
-                 {
-                     if (has_time_key)
-                         return false;
-                 }
- 
-                 has_time_column = tdengine_contain_time_column(oe->args, &(fpinfo->slinfo));
- 
-                 has_time_tags_or_fields_column = (has_time_column && !has_time_key);
- 
-                 /* Does not pushdown time comparison between tags/fields vs function */
-                 if (inner_cxt.is_comparison &&
-                     has_time_tags_or_fields_column &&
-                     tdengine_contain_time_function(oe->args))
-                 {
-                     return false;
-                 }
- 
-                 if (strcmp(cur_opname, ">") == 0 ||
-                     strcmp(cur_opname, "<") == 0 ||
-                     strcmp(cur_opname, ">=") == 0 ||
-                     strcmp(cur_opname, "<=") == 0 ||
-                     strcmp(cur_opname, "=") == 0)
-                 {
-                     List *first = list_make1(linitial(oe->args));
-                     List *second = list_make1(lsecond(oe->args));
-                     bool has_both_time_colum = tdengine_contain_time_column(first, &(fpinfo->slinfo)) &&
-                                                tdengine_contain_time_column(second, &(fpinfo->slinfo));
- 
-                     /*
-                      * Does not pushdown time comparsion using <, >, <=, >=, = between time key and time column
-                      * For example:
-                      *	time key vs time key
-                      *	time key vs tags/fields column
-                      */
-                     if (has_time_key && has_both_time_colum)
-                     {
-                         return false;
-                     }
- 
-                     /* Handle the operators <, >, <=, >= */
-                     if (strcmp(cur_opname, "=") != 0)
-                     {
-                         bool has_first_time_key = tdengine_contain_time_key_column(glob_cxt->relid, first);
-                         bool has_second_time_key = tdengine_contain_time_key_column(glob_cxt->relid, second);
-                         bool has_both_tags_or_fields_column = (has_both_time_colum && !has_first_time_key && !has_second_time_key);
- 
-                         /* Does not pushdown comparison between tags/fields column and time tags/field column */
-                         if (has_both_tags_or_fields_column)
-                             return false;
- 
-                         /*
-                          * Does not pushdown comparison between tags/fields column and time constant or time param
-                          * For example:
-                          *	tags/fields vs '2010-10-10 10:10:10'
-                          */
-                         if (has_time_tags_or_fields_column &&
-                             (tdengine_contain_time_const(oe->args) ||
-                              tdengine_contain_time_param(oe->args)))
-                         {
-                             return false;
-                         }
- 
-                         /*
-                          * Cannot pushdown to InfluxDB if there is string comparison
-                          * with: "<, >, <=, >=" operators.
-                          */
-                         if (tdengine_is_string_type((Node *)linitial(oe->args), &(fpinfo->slinfo)))
-                         {
-                             return false;
-                         }
-                     }
-                 }
- 
-                 /*
-                  * Does not support pushdown time comparison between time key column and time column +/- interval or
-                  * param +/- interval or function +/- interval except now() +/- interval.
-                  * Set flag here and recursive check in each node T_Var, T_Param, T_FuncExpr.
-                  */
-                 if (strcmp(cur_opname, "+") == 0 ||
-                     strcmp(cur_opname, "-") == 0)
-                 {
-                     inner_cxt.has_time_key = outer_cxt->has_time_key;
-                     inner_cxt.is_comparison = outer_cxt->is_comparison;
-                     inner_cxt.has_sub_or_add_operator = true;
-                 }
-                 else
-                 {
-                     inner_cxt.has_time_key = has_time_key;
-                 }
- 
-                 if (is_slvar || is_param)
-                 {
-                     collation = oe->inputcollid;
-                     check_type = false;
- 
-                     state = FDW_COLLATE_SAFE;
- 
-                     break;
-                 }
- 
-                 /*
-                  * Recurse to input subexpressions.
-                  */
-                 if (!tdengine_foreign_expr_walker((Node *) oe->args,
-                                                   glob_cxt, &inner_cxt))
-                     return false;
- 
-                 /*
-                  * Mixing aggregate and non-aggregate error occurs when SELECT
-                  * statement includes both of aggregate function and
-                  * standalone field key or tag key. It is unsafe to pushdown
-                  * if target operation expression has mixing aggregate and
-                  * non-aggregate, such as: (1+col1+sum(col2)),
-                  * (sum(col1)*col2)
-                  */
-                 if ((glob_cxt->mixing_aggref_status & INFLUXDB_TARGETS_MIXING_AGGREF_UNSAFE) ==
-                     INFLUXDB_TARGETS_MIXING_AGGREF_UNSAFE)
-                 {
-                     return false;
-                 }
- 
-                 /*
-                  * If operator's input collation is not derived from a foreign
-                  * Var, it can't be sent to remote.
-                  */
-                 if (oe->inputcollid == InvalidOid)
-                      /* OK, inputs are all noncollatable */ ;
-                 else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-                          oe->inputcollid != inner_cxt.collation)
-                     return false;
- 
-                 /* Result-collation handling is same as for functions */
-                 collation = oe->opcollid;
-                 if (collation == InvalidOid)
-                     state = FDW_COLLATE_NONE;
-                 else if (inner_cxt.state == FDW_COLLATE_SAFE &&
-                          collation == inner_cxt.collation)
-                     state = FDW_COLLATE_SAFE;
-                 else
-                     state = FDW_COLLATE_UNSAFE;
-             }
-             break;
-         case T_ScalarArrayOpExpr:
-             {
-                 ScalarArrayOpExpr *oe = (ScalarArrayOpExpr *) node;
- 
-                 tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(oe->opno));
-                 if (!HeapTupleIsValid(tuple))
-                     elog(ERROR, "cache lookup failed for operator %u", oe->opno);
-                 form = (Form_pg_operator) GETSTRUCT(tuple);
- 
-                 cur_opname = pstrdup(NameStr(form->oprname));
-                 ReleaseSysCache(tuple);
- 
-                 /*
-                  * Cannot pushdown to InfluxDB if there is string comparison
-                  * with: "<, >, <=, >=" operators
-                  */
-                 if (tdengine_is_string_type((Node *) linitial(oe->args), &(fpinfo->slinfo)))
-                 {
-                     if (strcmp(cur_opname, "<") == 0 ||
-                         strcmp(cur_opname, ">") == 0 ||
-                         strcmp(cur_opname, "<=") == 0 ||
-                         strcmp(cur_opname, ">=") == 0)
-                     {
-                         return false;
-                     }
-                 }
- 
-                 /*
-                  * Again, only built-in operators can be sent to remote.
-                  */
-                 if (!tdengine_is_builtin(oe->opno))
-                     return false;
- 
-                 /*
-                  * InfluxDB do not support OR with multi time column or time
-                  * column with !=, <> --> Not pushdown time column
-                  */
-                 if (tdengine_contain_time_column(oe->args, &(fpinfo->slinfo)))
-                 {
-                     return false;
-                 }
- 
-                 /*
-                  * Recurse to input subexpressions.
-                  */
-                 if (!tdengine_foreign_expr_walker((Node *) oe->args,
-                                                   glob_cxt, &inner_cxt))
-                     return false;
- 
-                 /*
-                  * If operator's input collation is not derived from a foreign
-                  * Var, it can't be sent to remote.
-                  */
-                 if (oe->inputcollid == InvalidOid)
-                      /* OK, inputs are all noncollatable */ ;
-                 else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-                          oe->inputcollid != inner_cxt.collation)
-                     return false;
- 
-                 /* Output is always boolean and so noncollatable. */
-                 collation = InvalidOid;
-                 state = FDW_COLLATE_NONE;
-             }
-             break;
-         case T_RelabelType:
-             {
-                 RelabelType *r = (RelabelType *) node;
- 
-                 /*
-                  * Recurse to input subexpression.
-                  */
-                 if (!tdengine_foreign_expr_walker((Node *) r->arg,
-                                                   glob_cxt, &inner_cxt))
-                     return false;
- 
-                 /*
-                  * RelabelType must not introduce a collation not derived from
-                  * an input foreign Var.
-                  */
-                 collation = r->resultcollid;
-                 if (collation == InvalidOid)
-                     state = FDW_COLLATE_NONE;
-                 else if (inner_cxt.state == FDW_COLLATE_SAFE &&
-                          collation == inner_cxt.collation)
-                     state = FDW_COLLATE_SAFE;
-                 else
-                     state = FDW_COLLATE_UNSAFE;
-             }
-             break;
-         case T_BoolExpr:
-             {
-                 BoolExpr   *b = (BoolExpr *) node;
- 
-                 is_time_column = false;
- 
-                 if (b->boolop == NOT_EXPR)
-                 {
-                     /* InfluxDB does not support not operator */
-                     return false;
-                 }
- 
-                 /*
-                  * Recurse to input subexpressions.
-                  */
-                 if (!tdengine_foreign_expr_walker((Node *) b->args,
-                                                   glob_cxt, &inner_cxt))
-                     return false;
- 
-                 /*
-                  * InfluxDB does not support OR with condition contain time
-                  * column
-                  */
-                 if (b->boolop == OR_EXPR && is_time_column)
-                 {
-                     is_time_column = false;
-                     return false;
-                 }
- 
-                 /* Output is always boolean and so noncollatable. */
-                 collation = InvalidOid;
-                 state = FDW_COLLATE_NONE;
-             }
-             break;
-         case T_List:
-             {
-                 List	   *l = (List *) node;
-                 ListCell   *lc;
- 
-                 /* inherit can_skip_cast flag */
-                 inner_cxt.can_skip_cast = outer_cxt->can_skip_cast;
-                 inner_cxt.influx_fill_enable = outer_cxt->influx_fill_enable;
-                 inner_cxt.has_time_key = outer_cxt->has_time_key;
-                 inner_cxt.has_sub_or_add_operator = outer_cxt->has_sub_or_add_operator;
-                 inner_cxt.is_comparison = outer_cxt->is_comparison;
- 
-                 /*
-                  * Recurse to component subexpressions.
-                  */
-                 foreach(lc, l)
-                 {
-                     if (!tdengine_foreign_expr_walker((Node *) lfirst(lc),
-                                                       glob_cxt, &inner_cxt))
-                         return false;
-                 }
- 
-                 /*
-                  * When processing a list, collation state just bubbles up
-                  * from the list elements.
-                  */
-                 collation = inner_cxt.collation;
-                 state = inner_cxt.state;
- 
-                 /* Don't apply exprType() to the list. */
-                 check_type = false;
-             }
-             break;
-         case T_Aggref:
-             {
-                 Aggref	   *agg = (Aggref *) node;
-                 ListCell   *lc;
-                 char	   *opername = NULL;
-                 bool		old_val;
-                 int			index_const = -1;
-                 int			index;
-                 bool		is_regex = false;
-                 bool		is_star_func = false;
-                 bool		is_not_star_func = false;
-                 Oid			agg_inputcollid = agg->inputcollid;
- 
-                 /* get function name and schema */
-                 opername = get_func_name(agg->aggfnoid);
- 
-                 /* these function can be passed to InfluxDB */
-                 if ((strcmp(opername, "sum") == 0 ||
-                      strcmp(opername, "max") == 0 ||
-                      strcmp(opername, "min") == 0 ||
-                      strcmp(opername, "count") == 0 ||
-                      strcmp(opername, "influx_distinct") == 0 ||
-                      strcmp(opername, "spread") == 0 ||
-                      strcmp(opername, "sample") == 0 ||
-                      strcmp(opername, "first") == 0 ||
-                      strcmp(opername, "last") == 0 ||
-                      strcmp(opername, "integral") == 0 ||
-                      strcmp(opername, "mean") == 0 ||
-                      strcmp(opername, "median") == 0 ||
-                      strcmp(opername, "influx_count") == 0 ||
-                      strcmp(opername, "influx_mode") == 0 ||
-                      strcmp(opername, "stddev") == 0 ||
-                      strcmp(opername, "influx_sum") == 0 ||
-                      strcmp(opername, "influx_max") == 0 ||
-                      strcmp(opername, "influx_min") == 0))
-                 {
-                     is_not_star_func = true;
-                 }
- 
-                 is_star_func = tdengine_is_star_func(agg->aggfnoid, opername);
- 
-                 if (!(is_star_func || is_not_star_func))
-                     return false;
- 
-                 /* Some aggregate tdengine functions have a const argument. */
-                 if (strcmp(opername, "sample") == 0 ||
-                     strcmp(opername, "integral") == 0)
-                     index_const = 1;
- 
-                 /*
-                  * Only sum(), count() and spread() are aggregate functions,
-                  * max(), min() and last() are selector functions
-                  */
-                 if (strcmp(opername, "sum") == 0 ||
-                     strcmp(opername, "spread") == 0 ||
-                     strcmp(opername, "count") == 0)
-                 {
-                     /* Mark target as aggregate function */
-                     glob_cxt->mixing_aggref_status |= INFLUXDB_TARGETS_MARK_AGGREF;
-                 }
- 
-                 /* Not safe to pushdown when not in grouping context */
-                 if (glob_cxt->foreignrel->reloptkind != RELOPT_UPPER_REL)
-                     return false;
- 
-                 /* Only non-split aggregates are pushable. */
-                 if (agg->aggsplit != AGGSPLIT_SIMPLE)
-                     return false;
- 
-                 /*
-                  * Save value of is_time_column before we check time argument
-                  * aggregate.
-                  */
-                 old_val = is_time_column;
-                 is_time_column = false;
- 
-                 /*
-                  * Recurse to input args. aggdirectargs, aggorder and
-                  * aggdistinct are all present in args, so no need to check
-                  * their shippability explicitly.
-                  */
-                 index = -1;
-                 foreach(lc, agg->args)
-                 {
-                     Node	   *n = (Node *) lfirst(lc);
-                     OpExpr	   *oe = (OpExpr *) NULL;
-                     Oid        resulttype = InvalidOid;
-                     bool       is_slvar = false;
- 
-                     index++;
- 
-                     /* If TargetEntry, extract the expression from it */
-                     if (IsA(n, TargetEntry))
-                     {
-                         TargetEntry *tle = (TargetEntry *) n;
- 
-                         n = (Node *) tle->expr;
- 
-                         if (IsA(n, Var) ||
-                             ((index == index_const) && IsA(n, Const)))
-                              /* arguments checking is OK */ ;
-                         else if (IsA(n, Const))
-                         {
-                             Const	   *arg = (Const *) n;
-                             char	   *extval;
- 
-                             if (arg->consttype == TEXTOID)
-                             {
-                                 is_regex = tdengine_is_regex_argument(arg, &extval);
-                                 if (is_regex)
-                                      /* arguments checking is OK */ ;
-                                 else
-                                     return false;
-                             }
-                             else
-                                 return false;
-                         }
-                         else if (fpinfo->slinfo.schemaless &&
-                                  (IsA(n, CoerceViaIO) || IsA(n, OpExpr)))
-                         {
-                             if (IsA(n, OpExpr))
-                             {
-                                 oe = (OpExpr *) n;
-                                 resulttype = oe->opresulttype;
-                             }
-                             else
-                             {
-                                 /* CoerceViaIO */
-                                 CoerceViaIO *cio = (CoerceViaIO *) n;
-                                 oe = (OpExpr *)cio->arg;
-                                 resulttype = cio->resulttype;
-                             }
- 
-                             if (tdengine_is_slvar_fetch((Node *)oe, &(fpinfo->slinfo)))
-                                 is_slvar = true;
-                             else
-                                 return false;
-                         }
-                         else if (is_star_func)
-                              /* arguments checking is OK */ ;
-                         else
-                             return false;
-                     }
- 
-                     /* Check if arg is Var */
-                     if (IsA(n, Var) || is_slvar)
-                     {
-                         Var		   *var;
-                         char	   *colname;
- 
-                         if (is_slvar)
-                         {
-                             Const *cnst;
- 
-                             var = linitial_node(Var, oe->args);
-                             cnst = lsecond_node(Const, oe->args);
-                             colname = TextDatumGetCString(cnst->constvalue);
-                             agg_inputcollid = var->varcollid;
-                         }
-                         else
-                         {
-                             var = (Var *) n;
- 
-                             colname = tdengine_get_column_name(glob_cxt->relid, var->varattno);
-                             resulttype = var->vartype;
-                         }
- 
-                         /* Not push down if arg is tag key */
-                         if (tdengine_is_tag_key(colname, glob_cxt->relid))
-                             return false;
- 
-                         /*
-                          * Not push down max(), min() if arg type is text
-                          * column
-                          */
-                         if ((strcmp(opername, "max") == 0 || strcmp(opername, "min") == 0)
-                             && (resulttype == TEXTOID || resulttype == InvalidOid))
-                             return false;
-                     }
- 
-                     if (!tdengine_foreign_expr_walker(n, glob_cxt, &inner_cxt))
-                         return false;
- 
-                     /*
-                      * Does not pushdown time column argument within aggregate
-                      * function except time related functions, because these
-                      * functions are converted from func(time, value) to
-                      * func(value) when deparsing.
-                      */
-                     if (is_time_column && !(strcmp(opername, "last") == 0 || strcmp(opername, "first") == 0))
-                     {
-                         is_time_column = false;
-                         return false;
-                     }
-                 }
- 
-                 /*
-                  * If there is no time column argument within aggregate
-                  * function, restore value of is_time_column.
-                  */
-                 is_time_column = old_val;
- 
-                 if (agg->aggorder || agg->aggfilter)
-                 {
-                     return false;
-                 }
- 
-                 /*
-                  * tdengine_fdw only supports push-down DISTINCT within
-                  * aggregate for count()
-                  */
-                 if (agg->aggdistinct && (strcmp(opername, "count") != 0))
-                     return false;
- 
-                 if (is_regex)
-                     check_type = false;
-                 else
-                 {
-                     /*
-                      * If aggregate's input collation is not derived from a
-                      * foreign Var, it can't be sent to remote.
-                      */
-                     if (agg_inputcollid == InvalidOid)
-                          /* OK, inputs are all noncollatable */ ;
-                     else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-                              agg_inputcollid != inner_cxt.collation)
-                         return false;
-                 }
- 
-                 /*
-                  * Detect whether node is introducing a collation not derived
-                  * from a foreign Var.  (If so, we just mark it unsafe for now
-                  * rather than immediately returning false, since the parent
-                  * node might not care.)
-                  */
-                 collation = agg->aggcollid;
-                 if (collation == InvalidOid)
-                     state = FDW_COLLATE_NONE;
-                 else if (inner_cxt.state == FDW_COLLATE_SAFE &&
-                          collation == inner_cxt.collation)
-                     state = FDW_COLLATE_SAFE;
-                 else if (collation == DEFAULT_COLLATION_OID)
-                     state = FDW_COLLATE_NONE;
-                 else
-                     state = FDW_COLLATE_UNSAFE;
-             }
-             break;
-         case T_CoerceViaIO:
-             {
-                 CoerceViaIO *cio = (CoerceViaIO *) node;
-                 Node *arg = (Node *)cio->arg;
- 
-                 /*
-                  * Does not pushdown time comparison between time key with time expression with tags/fields
-                  * For example:
-                  *	time key = (fields->>'c2')::timestamp + interval '1d'
-                  */
-                 if (tdengine_is_slvar_fetch(arg, &(fpinfo->slinfo)))
-                 {
-                     if (INFLUXDB_IS_TIME_TYPE(cio->resulttype))
-                     {
-                         if (outer_cxt->is_comparison &&
-                             outer_cxt->has_sub_or_add_operator &&
-                             outer_cxt->has_time_key)
-                         {
-                             return false;
-                         }
-                     }
-                 }
- 
-                 if (tdengine_is_slvar_fetch(arg, &(fpinfo->slinfo)) ||
-                     tdengine_is_param_fetch(arg, &(fpinfo->slinfo)))
-                 {
-                     if (!tdengine_foreign_expr_walker(arg, glob_cxt, &inner_cxt))
-                         return false;
-                 }
-                 else
-                 {
-                     return false;
-                 }
- 
-                 collation = InvalidOid;
-                 state = FDW_COLLATE_NONE;
-             }
-             break;
-         case T_NullTest:
-             {
-                 NullTest   *nt = (NullTest *) node;
-                 char       *colname;
- 
-                 colname = tdengine_get_slvar(nt->arg, &(fpinfo->slinfo));
-                 if (colname == NULL || !tdengine_is_tag_key(colname, glob_cxt->relid))
-                     return false;
- 
-                 /* Output is always boolean and so noncollatable. */
-                 collation = InvalidOid;
-                 state = FDW_COLLATE_NONE;
-             }
-             break;
-         case T_ArrayExpr:
-             {
-                 ArrayExpr  *a = (ArrayExpr *) node;
- 
-                 /*
-                  * Recurse to input subexpressions.
-                  */
-                 if (!tdengine_foreign_expr_walker((Node *) a->elements,
-                                                   glob_cxt, &inner_cxt))
-                     return false;
- 
-                 /*
-                  * ArrayExpr must not introduce a collation not derived from
-                  * an input foreign Var (same logic as for a function).
-                  */
-                 collation = a->array_collid;
-                 if (collation == InvalidOid)
-                     state = FDW_COLLATE_NONE;
-                 else if (inner_cxt.state == FDW_COLLATE_SAFE &&
-                          collation == inner_cxt.collation)
-                     state = FDW_COLLATE_SAFE;
-                 else if (collation == DEFAULT_COLLATION_OID)
-                     state = FDW_COLLATE_NONE;
-                 else
-                     state = FDW_COLLATE_UNSAFE;
-             }
-             break;
-         case T_DistinctExpr:
-             /* IS DISTINCT FROM */
-             return false;
-         default:
- 
-             /*
-              * If it's anything else, assume it's unsafe.  This list can be
-              * expanded later, but don't forget to add deparse support below.
-              */
-             return false;
-     }
- 
-     /*
-      * If result type of given expression is not built-in, it can't be sent to
-      * remote because it might have incompatible semantics on remote side.
-      */
-     if (check_type && !tdengine_is_builtin(exprType(node)))
-         return false;
- 
-     /*
-      * Now, merge my collation information into my parent's state.
-      */
-     if (state > outer_cxt->state)
-     {
-         /* Override previous parent state */
-         outer_cxt->collation = collation;
-         outer_cxt->state = state;
-     }
-     else if (state == outer_cxt->state)
-     {
-         /* Merge, or detect error if there's a collation conflict */
-         switch (state)
-         {
-             case FDW_COLLATE_NONE:
-                 /* Nothing + nothing is still nothing */
-                 break;
-             case FDW_COLLATE_SAFE:
-                 if (collation != outer_cxt->collation)
-                 {
-                     /*
-                      * Non-default collation always beats default.
-                      */
-                     if (outer_cxt->collation == DEFAULT_COLLATION_OID)
-                     {
-                         /* Override previous parent state */
-                         outer_cxt->collation = collation;
-                     }
-                     else if (collation != DEFAULT_COLLATION_OID)
-                     {
-                         /*
-                          * Conflict; show state as indeterminate.  We don't
-                          * want to "return false" right away, since parent
-                          * node might not care about collation.
-                          */
-                         outer_cxt->state = FDW_COLLATE_UNSAFE;
-                     }
-                 }
-                 break;
-             case FDW_COLLATE_UNSAFE:
-                 /* We're still conflicted ... */
-                 break;
-         }
-     }
- 
-     /* It looks OK */
-     return true;
- }
- 
- /*
-  * Build the targetlist for given relation to be deparsed as SELECT clause.
-  *
-  * The output targetlist contains the columns that need to be fetched from the
-  * foreign server for the given relation.  If foreignrel is an upper relation,
-  * then the output targetlist can also contains expressions to be evaluated on
-  * foreign server.
-  */
- List *
- tdengine_build_tlist_to_deparse(RelOptInfo *foreignrel)
- {
-     List	   *tlist = NIL;
-     InfluxDBFdwRelationInfo *fpinfo = (InfluxDBFdwRelationInfo *) foreignrel->fdw_private;
-     ListCell   *lc;
- 
-     /*
-      * For an upper relation, we have already built the target list while
-      * checking shippability, so just return that.
-      */
-     if (foreignrel->reloptkind == RELOPT_UPPER_REL)
-         return fpinfo->grouped_tlist;
- 
-     /*
-      * We require columns specified in foreignrel->reltarget->exprs and those
-      * required for evaluating the local conditions.
-      */
-     tlist = add_to_flat_tlist(tlist,
-                               pull_var_clause((Node *) foreignrel->reltarget->exprs,
-                                               PVC_RECURSE_PLACEHOLDERS));
-     foreach(lc, fpinfo->local_conds)
-     {
-         RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
- 
-         tlist = add_to_flat_tlist(tlist,
-                                   pull_var_clause((Node *) rinfo->clause,
-                                                   PVC_RECURSE_PLACEHOLDERS));
-     }
- 
-     return tlist;
- }
- 
- /*
-  * deparse remote DELETE statement
-  *
-  * The statement text is appended to buf, and we also create an integer List
-  * of the columns being retrieved by RETURNING (if any), which is returned
-  * to *retrieved_attrs.
-  */
- void
- tdengine_deparse_delete(StringInfo buf, PlannerInfo *root,
-                         Index rtindex, Relation rel,
-                         List *attname)
- {
-     int			i = 0;
-     ListCell   *lc;
- 
-     appendStringInfoString(buf, "DELETE FROM ");
-     tdengine_deparse_relation(buf, rel);
-     foreach(lc, attname)
-     {
-         int			attnum = lfirst_int(lc);
- 
-         appendStringInfo(buf, i == 0 ? " WHERE " : " AND ");
-         tdengine_deparse_column_ref(buf, rtindex, attnum, -1, root, false, false);
-         appendStringInfo(buf, "=$%d", i + 1);
-         i++;
-     }
-     elog(DEBUG1, "delete:%s", buf->data);
- }
- 
- /*
-  * deparse remote DELETE statement
-  *
-  * 'buf' is the output buffer to append the statement to 'rtindex' is the RT
-  * index of the associated target relation 'rel' is the relation descriptor
-  * for the target relation 'foreignrel' is the RelOptInfo for the target
-  * relation or the join relation containing all base relations in the query
-  * 'remote_conds' is the qual clauses that must be evaluated remotely
-  * '*params_list' is an output list of exprs that will become remote Params
-  * '*retrieved_attrs' is an output list of integers of columns being
-  * retrieved by RETURNING (if any)
-  */
- bool
- tdengine_deparse_direct_delete_sql(StringInfo buf, PlannerInfo *root,
-                                    Index rtindex, Relation rel,
-                                    RelOptInfo *foreignrel,
-                                    List *remote_conds,
-                                    List **params_list,
-                                    List **retrieved_attrs)
- {
-     deparse_expr_cxt context;
- 
-     /* Set up context struct for recursion */
-     context.root = root;
-     context.foreignrel = foreignrel;
-     context.scanrel = foreignrel;
-     context.buf = buf;
-     context.params_list = params_list;
-     context.can_delete_directly = true;
-     context.has_bool_cmp = false;
- 
-     appendStringInfoString(buf, "DELETE FROM ");
-     tdengine_deparse_relation(buf, rel);
- 
-     if (remote_conds)
-     {
-         appendStringInfoString(buf, " WHERE ");
-         tdengine_append_conditions(remote_conds, &context);
-     }
-     return context.can_delete_directly;
- }
- 
- /*
-  * Deparse SELECT statement for given relation into buf.
-  *
-  * tlist contains the list of desired columns to be fetched from foreign server.
-  * For a base relation fpinfo->attrs_used is used to construct SELECT clause,
-  * hence the tlist is ignored for a base relation.
-  *
-  * remote_conds is the list of conditions to be deparsed into the WHERE clause
-  * (or, in the case of upper relations, into the HAVING clause).
-  *
-  * If params_list is not NULL, it receives a list of Params and other-relation
-  * Vars used in the clauses; these values must be transmitted to the remote
-  * server as parameter values.
-  *
-  * If params_list is NULL, we're generating the query for EXPLAIN purposes,
-  * so Params and other-relation Vars should be replaced by dummy values.
-  *
-  * pathkeys is the list of pathkeys to order the result by.
-  *
-  * List of columns selected is returned in retrieved_attrs.
-  */
- void
- tdengine_deparse_select_stmt_for_rel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
-                                      List *tlist, List *remote_conds, List *pathkeys,
-                                      bool is_subquery, List **retrieved_attrs,
-                                      List **params_list,
-                                      bool has_limit)
- {
-     deparse_expr_cxt context;
-     InfluxDBFdwRelationInfo *fpinfo = (InfluxDBFdwRelationInfo *) rel->fdw_private;
-     List	   *quals;
- 
-     /*
-      * We handle relations for foreign tables, joins between those and upper
-      * relations.
-      */
-     Assert(rel->reloptkind == RELOPT_JOINREL ||
-            rel->reloptkind == RELOPT_BASEREL ||
-            rel->reloptkind == RELOPT_OTHER_MEMBER_REL ||
-            rel->reloptkind == RELOPT_UPPER_REL);
-     /* Fill portions of context common to upper, join and base relation */
-     context.buf = buf;
-     context.root = root;
-     context.foreignrel = rel;
-     context.scanrel = (rel->reloptkind == RELOPT_UPPER_REL) ? fpinfo->outerrel : rel;
-     context.params_list = params_list;
-     context.op_type = UNKNOWN_OPERATOR;
-     context.is_tlist = false;
-     context.can_skip_cast = false;
-     context.convert_to_timestamp = false;
-     context.has_bool_cmp = false;
-     /* Construct SELECT clause */
-     tdengine_deparse_select(tlist, retrieved_attrs, &context);
- 
-     /*
-      * For upper relations, the WHERE clause is built from the remote
-      * conditions of the underlying scan relation; otherwise, we can use the
-      * supplied list of remote conditions directly.
-      */
-     if (rel->reloptkind == RELOPT_UPPER_REL)
-     {
-         InfluxDBFdwRelationInfo *ofpinfo;
- 
-         ofpinfo = (InfluxDBFdwRelationInfo *) fpinfo->outerrel->fdw_private;
-         quals = ofpinfo->remote_conds;
-     }
-     else
-         quals = remote_conds;
- 
-     /* Construct FROM and WHERE clauses */
-     tdengine_deparse_from_expr(quals, &context);
- 
-     if (rel->reloptkind == RELOPT_UPPER_REL)
-     {
-         /* Append GROUP BY clause */
-         tdengine_append_group_by_clause(tlist, &context);
- 
-         /* Append HAVING clause */
-         if (remote_conds)
-         {
-             appendStringInfo(buf, " HAVING ");
-             tdengine_append_conditions(remote_conds, &context);
-         }
-     }
- 
-     /* Add ORDER BY clause if we found any useful pathkeys */
-     if (pathkeys)
-         tdengine_append_order_by_clause(pathkeys, &context);
- 
-     /* Add LIMIT clause if necessary */
-     if (has_limit)
-         tdengine_append_limit_clause(&context);
- 
- }
- 
- /**
-  * get_proname
-  *
-  * Add a aggregate function name of 'oid' to 'proname'
-  * by fetching from pg_proc system catalog.
-  *
-  * @param[in] oid
-  * @param[out] procname
-  */
- static void
- get_proname(Oid oid, StringInfo proname)
- {
-     HeapTuple	proctup;
-     Form_pg_proc procform;
-     const char *name;
- 
-     proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(oid));
-     if (!HeapTupleIsValid(proctup))
-         elog(ERROR, "cache lookup failed for function %u", oid);
-     procform = (Form_pg_proc) GETSTRUCT(proctup);
- 
-     /* Always print the function name */
-     name = NameStr(procform->proname);
-     appendStringInfoString(proname, name);
- 
-     ReleaseSysCache(proctup);
- }
- 
- /*
-  * Deparse SELECT statment
-  */
- static void
- tdengine_deparse_select(List *tlist, List **retrieved_attrs, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     PlannerInfo *root = context->root;
-     RelOptInfo *foreignrel = context->foreignrel;
-     InfluxDBFdwRelationInfo *fpinfo = (InfluxDBFdwRelationInfo *) foreignrel->fdw_private;
- 
-     /*
-      * Construct SELECT list
-      */
-     appendStringInfoString(buf, "SELECT ");
- 
-     if (foreignrel->reloptkind == RELOPT_JOINREL ||
-         fpinfo->is_tlist_func_pushdown == true ||
-         foreignrel->reloptkind == RELOPT_UPPER_REL)
-     {
-         /*
-          * For a join or upper relation the input tlist gives the list of
-          * columns required to be fetched from the foreign server.
-          */
-         tdengine_deparse_explicit_target_list(tlist, retrieved_attrs, context);
-     }
-     else
-     {
-         /*
-          * For a base relation fpinfo->attrs_used gives the list of columns
-          * required to be fetched from the foreign server.
-          */
-         RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
- 
-         /*
-          * Core code already has some lock on each rel being planned, so we
-          * can use NoLock here.
-          */
-         Relation	rel = table_open(rte->relid, NoLock);
- 
-         if (fpinfo->slinfo.schemaless)
-             tdengine_deparse_target_list_schemaless(buf, rel, rte->relid,
-                                                     fpinfo->attrs_used, retrieved_attrs,
-                                                     fpinfo->all_fieldtag,
-                                                     fpinfo->slcols);
-         else
-             tdengine_deparse_target_list(buf, root, foreignrel->relid, rel, fpinfo->attrs_used, retrieved_attrs);
- 
-         table_close(rel, NoLock);
-     }
- }
- 
- /*
-  * Construct a FROM clause and, if needed, a WHERE clause, and append those to
-  * "buf".
-  *
-  * quals is the list of clauses to be included in the WHERE clause.
-  */
- static void
- tdengine_deparse_from_expr(List *quals, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     RelOptInfo *scanrel = context->scanrel;
- 
-     /* For upper relations, scanrel must be either a joinrel or a baserel */
-     Assert(context->foreignrel->reloptkind != RELOPT_UPPER_REL ||
-            scanrel->reloptkind == RELOPT_JOINREL ||
-            scanrel->reloptkind == RELOPT_BASEREL);
- 
-     /* Construct FROM clause */
-     appendStringInfoString(buf, " FROM ");
-     tdengine_deparse_from_expr_for_rel(buf, context->root, scanrel,
-                                        (bms_num_members(scanrel->relids) > 1),
-                                        context->params_list);
- 
-     /* Construct WHERE clause */
-     if (quals != NIL)
-     {
-         appendStringInfo(buf, " WHERE ");
-         tdengine_append_conditions(quals, context);
-     }
- }
- 
- /*
-  * Deparse conditions from the provided list and append them to buf.
-  *
-  * The conditions in the list are assumed to be ANDed. This function is used to
-  * deparse WHERE clauses, JOIN .. ON clauses and HAVING clauses.
-  */
- static void
- tdengine_append_conditions(List *exprs, deparse_expr_cxt *context)
- {
-     int			nestlevel;
-     ListCell   *lc;
-     bool		is_first = true;
-     StringInfo	buf = context->buf;
- 
-     /* Make sure any constants in the exprs are printed portably */
-     nestlevel = tdengine_set_transmission_modes();
- 
-     foreach(lc, exprs)
-     {
-         Expr	   *expr = (Expr *) lfirst(lc);
- 
-         /* Extract clause from RestrictInfo, if required */
-         if (IsA(expr, RestrictInfo))
-             expr = ((RestrictInfo *) expr)->clause;
- 
-         /* Connect expressions with "AND" and parenthesize each condition. */
-         if (!is_first)
-             appendStringInfoString(buf, " AND ");
- 
-         context->has_bool_cmp = true;
- 
-         appendStringInfoChar(buf, '(');
-         tdengine_deparse_expr(expr, context);
-         appendStringInfoChar(buf, ')');
- 
-         context->has_bool_cmp = false;
- 
-         is_first = false;
-     }
- 
-     tdengine_reset_transmission_modes(nestlevel);
- }
- 
- /*
-  * Deparse given targetlist and append it to context->buf.
-  *
-  * tlist is list of TargetEntry's which in turn contain Var nodes.
-  *
-  * retrieved_attrs is the list of continuously increasing integers starting
-  * from 1. It has same number of entries as tlist.
-  */
- static void
- tdengine_deparse_explicit_target_list(List *tlist, List **retrieved_attrs,
-                                       deparse_expr_cxt *context)
- {
-     ListCell   *lc;
-     StringInfo	buf = context->buf;
-     int			i = 0;
-     bool		first = true;
-     bool		is_col_grouping_target = false;
-     bool		need_field_key;
-     bool		is_need_comma = false;
-     bool		selected_all_fieldtag = false;
-     InfluxDBFdwRelationInfo *fpinfo = (InfluxDBFdwRelationInfo *) context->foreignrel->fdw_private;
- 
-     *retrieved_attrs = NIL;
- 
-     /*
-      * We do not construct grouping target column in SELECT InfluxDB SQL. We
-      * just check for need to add field key more e.g. SELECT col1, col2, col3
-      * FROM table GROUP BY col1, col2; (col1 and col2 are tag keys) --> SELECT
-      * col3 FROM table GROUP BY col1, col2; So, firstly we need to check
-      * whether all target are columns or not.
-      */
-     need_field_key = true;
- 
-     context->is_tlist = true;
- 
-     /* Contruct targets for remote SELECT statement */
-     foreach(lc, tlist)
-     {
-         TargetEntry *tle = lfirst_node(TargetEntry, lc);
-         bool is_slvar = false;
- 
-         if (tdengine_is_slvar_fetch((Node *)tle->expr, &(fpinfo->slinfo)))
-             is_slvar = true;
- 
-         /* Check whether column is a grouping target or not */
-         if (!fpinfo->is_tlist_func_pushdown && IsA((Expr *) tle->expr, Var))
-         {
-             is_col_grouping_target = tdengine_is_grouping_target(tle, context->root->parse);
-         }
- 
-         if (is_slvar)
-         {
-             is_col_grouping_target = tdengine_is_grouping_target(tle, context->root->parse);
-         }
- 
-         if (IsA((Expr *) tle->expr, Aggref) ||
-             (IsA((Expr *) tle->expr, OpExpr) && !is_slvar) ||
-             IsA((Expr *) tle->expr, FuncExpr) ||
-             ((IsA((Expr *) tle->expr, Var) || is_slvar) && !is_col_grouping_target))
-         {
-             bool		is_skip_expr = false;
- 
-             if (IsA((Expr *) tle->expr, FuncExpr))
-             {
-                 FuncExpr   *fe = (FuncExpr *) tle->expr;
-                 StringInfo	func_name = makeStringInfo();
- 
-                 get_proname(fe->funcid, func_name);
-                 if (strcmp(func_name->data, "influx_time") == 0 ||
-                     strcmp(func_name->data, "influx_fill_numeric") == 0 ||
-                     strcmp(func_name->data, "influx_fill_option") == 0)
-                     is_skip_expr = true;
-             }
- 
-             if (is_need_comma && !is_skip_expr)
-                 appendStringInfoString(buf, ", ");
-             need_field_key = false;
- 
-             if (!is_skip_expr)
-             {
-                 if (fpinfo->is_tlist_func_pushdown && fpinfo->all_fieldtag)
-                     selected_all_fieldtag = true;
-                 else
-                 {
-                     first = false;
-                     tdengine_deparse_expr((Expr *) tle->expr, context);
-                     is_need_comma = true;
-                 }
-             }
-         }
- 
-         /*
-          * Check all target columns are tag keys or not. If all target columns
-          * are tag keys, need to append a field key more.
-          */
-         if (IsA((Expr *) tle->expr, Var) && need_field_key)
-         {
-             RangeTblEntry *rte = planner_rt_fetch(context->scanrel->relid, context->root);
-             char	   *colname = tdengine_get_column_name(rte->relid, ((Var *) tle->expr)->varattno);
- 
-             if (!tdengine_is_tag_key(colname, rte->relid))
-                 need_field_key = false;
-         }
- 
-         *retrieved_attrs = lappend_int(*retrieved_attrs, i + 1);
-         i++;
-     }
-     context->is_tlist = false;
- 
-     if (i == 0 || selected_all_fieldtag)
-     {
-         appendStringInfoString(buf, "*");
-         return;
-     }
- 
-     if (need_field_key)
-     {
-         /*
-          * For a base relation fpinfo->attrs_used gives the list of columns
-          * required to be fetched from the foreign server.
-          */
-         RangeTblEntry *rte = planner_rt_fetch(context->scanrel->relid, context->root);
- 
-         /*
-          * Core code already has some lock on each rel being planned, so we
-          * can use NoLock here.
-          */
-         Relation	rel = table_open(rte->relid, NoLock);
-         TupleDesc	tupdesc = RelationGetDescr(rel);
- 
-         tdengine_append_field_key(tupdesc, context->buf, context->scanrel->relid, context->root, first);
- 
-         table_close(rel, NoLock);
-         return;
-     }
- }
- 
- /*
-  * Construct FROM clause for given relation
-  *
-  * The function constructs ... JOIN ... ON ... for join relation. For a base
-  * relation it just returns schema-qualified tablename, with the appropriate
-  * alias if so requested.
-  */
- static void
- tdengine_deparse_from_expr_for_rel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
-                                    bool use_alias, List **params_list)
- {
-     Assert(!use_alias);
-     if (foreignrel->reloptkind == RELOPT_JOINREL)
-     {
-         /* Join pushdown not supported */
-         Assert(false);
-     }
-     else
-     {
-         RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
- 
-         /*
-          * Core code already has some lock on each rel being planned, so we
-          * can use NoLock here.
-          */
-         Relation	rel = table_open(rte->relid, NoLock);
- 
-         tdengine_deparse_relation(buf, rel);
- 
-         table_close(rel, NoLock);
-     }
- }
- 
- void
- tdengine_deparse_analyze(StringInfo sql, char *dbname, char *relname)
- {
-     appendStringInfo(sql, "SELECT");
-     appendStringInfo(sql, " round(((data_length + index_length)), 2)");
-     appendStringInfo(sql, " FROM information_schema.TABLES");
-     appendStringInfo(sql, " WHERE table_schema = '%s' AND table_name = '%s'", dbname, relname);
- }
- 
- /*
-  * Emit a target list that retrieves the columns specified in attrs_used.
-  * This is used for both SELECT and RETURNING targetlists.
-  */
- static void
- tdengine_deparse_target_list(StringInfo buf,
-                              PlannerInfo *root,
-                              Index rtindex,
-                              Relation rel,
-                              Bitmapset *attrs_used,
-                              List **retrieved_attrs)
- {
-     TupleDesc	tupdesc = RelationGetDescr(rel);
-     bool		have_wholerow;
-     bool		first;
-     int			i;
-     bool		need_field_key; /* Check for need to add field key more */
- 
-     /* If there's a whole-row reference, we'll need all the columns. */
-     have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
-                                   attrs_used);
- 
-     first = true;
-     need_field_key = true;
- 
-     *retrieved_attrs = NIL;
-     for (i = 1; i <= tupdesc->natts; i++)
-     {
-         Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
- 
-         /* Ignore dropped attributes. */
-         if (attr->attisdropped)
-             continue;
- 
-         if (have_wholerow ||
-             bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
-                           attrs_used))
-         {
-             RangeTblEntry *rte = planner_rt_fetch(rtindex, root);
-             char	   *name = tdengine_get_column_name(rte->relid, i);
- 
-             /* Skip if column is time */
-             if (!INFLUXDB_IS_TIME_COLUMN(name))
-             {
-                 if (!tdengine_is_tag_key(name, rte->relid))
-                     need_field_key = false;
- 
-                 if (!first)
-                     appendStringInfoString(buf, ", ");
-                 first = false;
-                 tdengine_deparse_column_ref(buf, rtindex, i, -1, root, false, false);
-             }
- 
-             *retrieved_attrs = lappend_int(*retrieved_attrs, i);
-         }
-     }
- 
-     /* Use '*' instead of NULL because InfluxDB does not support NULL */
-     if (first)
-     {
-         appendStringInfoString(buf, "*");
-         return;
-     }
- 
-     /* If all of target list are tag keys, need to append a field key more */
-     if (need_field_key)
-     {
-         tdengine_append_field_key(tupdesc, buf, rtindex, root, first);
-     }
- }
- 
- /*
-  * Deparse WHERE clauses in given list of RestrictInfos and append them to buf.
-  *
-  * baserel is the foreign table we're planning for.
-  *
-  * If no WHERE clause already exists in the buffer, is_first should be true.
-  *
-  * If params is not NULL, it receives a list of Params and other-relation Vars
-  * used in the clauses; these values must be transmitted to the remote server
-  * as parameter values.
-  *
-  * If params is NULL, we're generating the query for EXPLAIN purposes,
-  * so Params and other-relation Vars should be replaced by dummy values.
-  */
- void
- tdengine_append_where_clause(StringInfo buf,
-                              PlannerInfo *root,
-                              RelOptInfo *baserel,
-                              List *exprs,
-                              bool is_first,
-                              List **params)
- {
-     deparse_expr_cxt context;
-     ListCell   *lc;
- 
-     if (params)
-         *params = NIL;			/* initialize result list to empty */
- 
-     /* Set up context struct for recursion */
-     context.root = root;
-     context.foreignrel = baserel;
-     context.buf = buf;
-     context.params_list = params;
-     context.is_tlist = false;
-     context.can_skip_cast = false;
-     context.convert_to_timestamp = false;
- 
-     foreach(lc, exprs)
-     {
-         RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
- 
-         /* Connect expressions with "AND" and parenthesize each condition. */
-         if (is_first)
-             appendStringInfoString(buf, " WHERE ");
-         else
-             appendStringInfoString(buf, " AND ");
- 
-         appendStringInfoChar(buf, '(');
-         tdengine_deparse_expr(ri->clause, &context);
-         appendStringInfoChar(buf, ')');
- 
-         is_first = false;
-     }
- }
- 
- /*
-  * Construct name to use for given column, and emit it into buf.
-  * If it has a column_name FDW option, use that instead of attribute name.
-  */
- static void
- tdengine_deparse_column_ref(StringInfo buf, int varno, int varattno, Oid vartype,
-                             PlannerInfo *root, bool convert, bool *can_delete_directly)
- {
-     RangeTblEntry *rte;
-     char	   *colname = NULL;
- 
-     /* varno must not be any of OUTER_VAR, INNER_VAR and INDEX_VAR. */
-     Assert(!IS_SPECIAL_VARNO(varno));
- 
-     /* Get RangeTblEntry from array in PlannerInfo. */
-     rte = planner_rt_fetch(varno, root);
- 
-     colname = tdengine_get_column_name(rte->relid, varattno);
- 
-     /*
-      * If WHERE clause contains fields key, DELETE statement can not push down
-      * directly.
-      */
-     if (can_delete_directly)
-         if (!INFLUXDB_IS_TIME_COLUMN(colname) && !tdengine_is_tag_key(colname, rte->relid))
-             *can_delete_directly = false;
- 
-     if (convert && vartype == BOOLOID)
-     {
-         appendStringInfo(buf, "(%s=true)", tdengine_quote_identifier(colname, QUOTE));
-     }
-     else
-     {
-         if (INFLUXDB_IS_TIME_COLUMN(colname))
-             appendStringInfoString(buf, "time");
-         else
-             appendStringInfoString(buf, tdengine_quote_identifier(colname, QUOTE));
-     }
- }
- 
- static void
- add_backslash(StringInfo buf, const char *ptr, const char *regex_special)
- {
-     char		ch = *ptr;
- 
-     /* Check regex special character */
-     if (strchr(regex_special, ch) != NULL)
-     {
-         /* Escape this char */
-         appendStringInfoChar(buf, '\\');
-         appendStringInfoChar(buf, ch);
-     }
-     else
-     {
-         appendStringInfoChar(buf, ch);
-     }
- }
- 
- /*
-  * Check if the last percent sign is escaped.
-  *
-  * Return true if there is no '%' sign or '%' sign is escaped
-  * Return false if '%' sign is not escaped
-  */
- static bool
- tdengine_last_percent_sign_check(const char *val)
- {
-     int len;
-     int count_backslash = 0;
- 
-     if (val == NULL)
-         return false;
- 
-     len = strlen(val) - 1;
- 
-     if (val[len] != '%')
-         return true;
- 
-     len--;
-     while (len >= 0 && val[len] == '\\')
-     {
-         count_backslash ++;
-         len--;
-     }
- 
-     if (count_backslash % 2 == 0)
-         return false;
- 
-     return true;
- }
- 
- /*
-  * Convert a LIKE's pattern to Regex's pattern and append to buf
-  *
-  * We convert LIKE's pattern on PostgreSQL to regex pattern on
-  * InfluxDB.
-  *
-  * Surround regex pattern by '/' characters.
-  * Add the prefix (?i) to the pattern if using case-insensitive operators.
-  *
-  * PostgreSQL's percent sign is used to matches any sequence of
-  * zero or more characters. We convert '%' sign to "(.*)" regex string.
-  *
-  * PostgreSQL's underscore is used to matches any single character.
-  * We convert '_' character to "(.{1})" regex string.
-  *
-  * Escape regex special characters: "\\^$.|?*+()[{%"
-  */
- static void
- tdengine_deparse_string_like_pattern(StringInfo buf, const char *val, PatternMatchingOperator op_type)
- {
-     const char *regex_special = "\\^$.|?*+()[{%";
-     const char *ptr = val;
- 
-     appendStringInfoChar(buf, '/');
- 
-     if (op_type == ILIKE_OPERATOR || op_type == NOT_ILIKE_OPERATOR)
-         appendStringInfoString(buf, "(?i)");
- 
-     /*
-      * If there is no '%' sign at begin of string, add '^' sign at begin of string.
-      * For example,
-      *	- 'A\%'    -> '^A\%$'
-      *	- 'A\\%'   -> '^A\\(.*)'
-      *	- 'A\\\%'  -> '^A\\\%$'
-      */
-     if (val[0] != '%')
-         appendStringInfoChar(buf, '^');
- 
-     while (*ptr != '\0')
-     {
-         switch (*ptr)
-         {
-             case '%':
-                 /* Change to regex string */
-                 appendStringInfoString(buf, "(.*)");
-                 break;
-             case '_':
-                 /* Change to regex string */
-                 appendStringInfoString(buf, "(.{1})");
-                 break;
-             case '\\':
- 
-                 /*
-                  * Backslash character is the escape character of PostgreSQL.
-                  * We skip backslash, and move to the next character which is
-                  * escaped by backslash and will be escapsed if it is a regex
-                  * special character.
-                  */
-                 ptr++;
- 
-                 /* Check terminate character */
-                 if (*ptr == '\0')
-                 {
-                     elog(ERROR, "invalid pattern matching");
-                 }
-                 else
-                 {
-                     add_backslash(buf, ptr, regex_special);
-                 }
-                 break;
-             default:
-                 add_backslash(buf, ptr, regex_special);
-                 break;
-         }
- 
-         ptr++;
-     }
- 
-     /*
-      * If either there is no '%' sign or there is a '%' sign (but escaped) at end of string, add '$' sign at the end of string.
-      * For example:
-      *	- '%Abc'    -> '(.*)Abc$'       No '%', add '$' at end of string
-      *	- '%Abc%'   -> '(.*)Abc(.*)'    '%' is not escaped, don't add '$' at end of string
-      *	- '%Abc\%'  -> '(.*)Abc\%$'     '%' is escaped, add '$' at end of string
-      *	- '%Abc\\%' -> '(.*)Abc\\(.*)'  '%' is not escaped, don't add '$' at end of string
-      *	- 'Abc\%'   -> '^Abc\%$'        '%' is escaped, add '$' at end of string
-      */
-     if (tdengine_last_percent_sign_check(val))
-         appendStringInfoChar(buf, '$');
- 
-     appendStringInfoChar(buf, '/');
- 
-     return;
- }
- 
- /*
-  * Append a SQL string regex representing "val" to buf.
-  *
-  * Pushdown PostgreSQL's regrex pattern to InfluxDB
-  * 
-  * Surround regex pattern by '/' characters.
-  * Add the prefix (?i) to the pattern if using case-insensitive operators.
-  */
- static void
- tdengine_deparse_string_regex_pattern(StringInfo buf, const char *val, PatternMatchingOperator op_type)
- {
-     appendStringInfoChar(buf, '/');
- 
-     if (op_type == REGEX_MATCH_CASE_INSENSITIVE_OPERATOR || op_type == REGEX_NOT_MATCH_CASE_INSENSITIVE_OPERATOR)
-         appendStringInfoString(buf, "(?i)");
- 
-     appendStringInfoString(buf, val);
- 
-     appendStringInfoChar(buf, '/');
-     return;
- }
- 
- /*
-  * Append a fill option value as a string literal
-  */
- static void
- tdengine_deparse_fill_option(StringInfo buf, const char *val)
- {
-     appendStringInfo(buf, "%s", val);
- }
- 
- /*
-  * Append a SQL string literal representing "val" to buf.
-  */
- void
- tdengine_deparse_string_literal(StringInfo buf, const char *val)
- {
-     const char *valptr;
- 
-     appendStringInfoChar(buf, '\'');
-     for (valptr = val; *valptr; valptr++)
-     {
-         char		ch = *valptr;
- 
-         if (SQL_STR_DOUBLE(ch, true))
-             appendStringInfoChar(buf, ch);
-         appendStringInfoChar(buf, ch);
-     }
-     appendStringInfoChar(buf, '\'');
- }
- 
- /*
-  * Deparse given expression into context->buf.
-  *
-  * This function must support all the same node types that tdengine_foreign_expr_walker
-  * accepts.
-  *
-  * Note: unlike ruleutils.c, we just use a simple hard-wired parenthesization
-  * scheme: anything more complex than a Var, Const, function call or cast
-  * should be self-parenthesized.
-  */
- static void
- tdengine_deparse_expr(Expr *node, deparse_expr_cxt *context)
- {
-     bool		outer_can_skip_cast = context->can_skip_cast;
-     bool		outer_convert_to_timestamp = context->convert_to_timestamp;
- 
-     if (node == NULL)
-         return;
- 
-     context->can_skip_cast = false;
-     context->convert_to_timestamp = false;
- 
-     switch (nodeTag(node))
-     {
-         case T_Var:
-             context->convert_to_timestamp = outer_convert_to_timestamp;
-             tdengine_deparse_var((Var *) node, context);
-             break;
-         case T_Const:
-             context->convert_to_timestamp = outer_convert_to_timestamp;
-             tdengine_deparse_const((Const *) node, context, 0);
-             break;
-         case T_Param:
-             tdengine_deparse_param((Param *) node, context);
-             break;
-         case T_FuncExpr:
-             context->can_skip_cast = outer_can_skip_cast;
-             tdengine_deparse_func_expr((FuncExpr *) node, context);
-             break;
-         case T_OpExpr:
-             context->convert_to_timestamp = outer_convert_to_timestamp;
-             tdengine_deparse_op_expr((OpExpr *) node, context);
-             break;
-         case T_ScalarArrayOpExpr:
-             tdengine_deparse_scalar_array_op_expr((ScalarArrayOpExpr *) node, context);
-             break;
-         case T_RelabelType:
-             tdengine_deparse_relabel_type((RelabelType *) node, context);
-             break;
-         case T_BoolExpr:
-             tdengine_deparse_bool_expr((BoolExpr *) node, context);
-             break;
-         case T_NullTest:
-             tdengine_deparse_null_test((NullTest *) node, context);
-             break;
-         case T_ArrayExpr:
-             tdengine_deparse_array_expr((ArrayExpr *) node, context);
-             break;
-         case T_Aggref:
-             tdengine_deparse_aggref((Aggref *) node, context);
-             break;
-         case T_CoerceViaIO:
-             tdengine_deparse_coerce_via_io((CoerceViaIO *) node, context);
-             break;
-         default:
-             elog(ERROR, "unsupported expression type for deparse: %d",
-                  (int) nodeTag(node));
-             break;
-     }
- }
- 
- /*
-  * Deparse given Var node into context->buf.
-  *
-  * If the Var belongs to the foreign relation, just print its remote name.
-  * Otherwise, it's effectively a Param (and will in fact be a Param at
-  * run time).  Handle it the same way we handle plain Params --- see
-  * deparseParam for comments.
-  */
- static void
- tdengine_deparse_var(Var *node, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     Relids		relids = context->scanrel->relids;
- 
-     /* Qualify columns when multiple relations are involved. */
-     /* bool		qualify_col = (bms_num_members(relids) > 1); */
- 
-     if (bms_is_member(node->varno, relids) && node->varlevelsup == 0)
-         /* if (node->varno == context->foreignrel->relid && */
-         /* node->varlevelsup == 0) */
-     {
-         bool		convert = context->has_bool_cmp;	/* Boolean Var should be
-                                                          * deparsed with
-                                                          * conversion only when
-                                                          * there is boolean
-                                                          * comparison */
- 
-         /* Var belongs to foreign table */
-         tdengine_deparse_column_ref(buf, node->varno, node->varattno, node->vartype, context->root, convert, &context->can_delete_directly);
-     }
-     else
-     {
-         /* Treat like a Param */
-         if (context->params_list)
-         {
-             int			pindex = 0;
-             ListCell   *lc;
- 
-             /* find its index in params_list */
-             foreach(lc, *context->params_list)
-             {
-                 pindex++;
-                 if (equal(node, (Node *) lfirst(lc)))
-                     break;
-             }
-             if (lc == NULL)
-             {
-                 /* not in list, so add it */
-                 pindex++;
-                 *context->params_list = lappend(*context->params_list, node);
-             }
-             tdengine_print_remote_param(pindex, node->vartype, node->vartypmod, context);
-         }
-         else
-         {
-             tdengine_print_remote_placeholder(node->vartype, node->vartypmod, context);
-         }
-     }
- }
- 
- /*
-  * Deparse given constant value into context->buf.
-  *
-  * This function has to be kept in sync with ruleutils.c's get_const_expr.
-  * As for that function, showtype can be -1 to never show "::typename" decoration,
-  * or +1 to always show it, or 0 to show it only if the constant wouldn't be assumed
-  * to be the right type by default.
-  */
- static void
- tdengine_deparse_const(Const *node, deparse_expr_cxt *context, int showtype)
- {
-     StringInfo	buf = context->buf;
-     Oid			typoutput;
-     bool		typIsVarlena;
-     char	   *extval;
-     char	   *type_name;
- 
-     if (node->constisnull)
-     {
-         appendStringInfoString(buf, "NULL");
-         return;
-     }
- 
-     getTypeOutputInfo(node->consttype,
-                       &typoutput, &typIsVarlena);
- 
-     switch (node->consttype)
-     {
-         case INT2OID:
-         case INT4OID:
-         case INT8OID:
-         case OIDOID:
-         case FLOAT4OID:
-         case FLOAT8OID:
-         case NUMERICOID:
-             {
-                 extval = OidOutputFunctionCall(typoutput, node->constvalue);
- 
-                 /*
-                  * No need to quote unless it's a special value such as 'NaN'.
-                  * See comments in get_const_expr().
-                  */
-                 if (strspn(extval, "0123456789+-eE.") == strlen(extval))
-                 {
-                     if (extval[0] == '+' || extval[0] == '-')
-                         appendStringInfo(buf, "(%s)", extval);
-                     else
-                         appendStringInfoString(buf, extval);
-                 }
-                 else
-                     appendStringInfo(buf, "'%s'", extval);
-             }
-             break;
-         case BITOID:
-         case VARBITOID:
-             extval = OidOutputFunctionCall(typoutput, node->constvalue);
-             appendStringInfo(buf, "B'%s'", extval);
-             break;
-         case BOOLOID:
-             extval = OidOutputFunctionCall(typoutput, node->constvalue);
-             if (strcmp(extval, "t") == 0)
-                 appendStringInfoString(buf, "true");
-             else
-                 appendStringInfoString(buf, "false");
-             break;
- 
-         case BYTEAOID:
- 
-             /*
-              * the string for BYTEA always seems to be in the format "\\x##"
-              * where # is a hex digit, Even if the value passed in is
-              * 'hi'::bytea we will receive "\x6869". Making this assumption
-              * allows us to quickly convert postgres escaped strings to
-              * InfluxDB ones for comparison
-              */
-             extval = OidOutputFunctionCall(typoutput, node->constvalue);
-             appendStringInfo(buf, "X\'%s\'", extval + 2);
-             break;
-         case TIMESTAMPTZOID:
-             {
-                 Datum		datum;
- 
-                 /*
-                  * For time key column, convert from TIMESTAMPTZOID to TIMESTAMP ex: '2015-08-18
-                  * 09:00:00+09' -> '2015-08-18 00:00:00'
-                  */
-                 if (context->convert_to_timestamp)
-                 {
-                     datum = DirectFunctionCall2(timestamptz_zone, CStringGetTextDatum("UTC"), node->constvalue);
-                     getTypeOutputInfo(TIMESTAMPOID, &typoutput, &typIsVarlena);
-                 }
-                 else
-                 {
-                     datum = node->constvalue;
-                     getTypeOutputInfo(TIMESTAMPTZOID, &typoutput, &typIsVarlena);
-                 }
- 
-                 /* Convert to string */
-                 extval = OidOutputFunctionCall(typoutput, datum);
-                 appendStringInfo(buf, "'%s'", extval);
-                 break;
-             }
-         case INTERVALOID:
-             {
-                 Interval   *interval = DatumGetIntervalP(node->constvalue);
- #if (PG_VERSION_NUM >= 150000)
-                 struct pg_itm tm;
- 
-                 interval2itm(*interval, &tm);
- #else
-                 struct pg_tm tm;
-                 fsec_t		fsec;
- 
-                 interval2tm(*interval, &tm, &fsec);
- #endif
- 
- #if (PG_VERSION_NUM >= 150000)
-                 appendStringInfo(buf, "%dd%ldh%dm%ds%du", tm.tm_mday, tm.tm_hour,
-                                  tm.tm_min, tm.tm_sec, tm.tm_usec
- #else
-                 appendStringInfo(buf, "%dd%dh%dm%ds%du", tm.tm_mday, tm.tm_hour,
-                                  tm.tm_min, tm.tm_sec, fsec
- #endif
-                     );
-                 break;
-             }
-         default:
-             extval = OidOutputFunctionCall(typoutput, node->constvalue);
- 
-             /*
-              * Get type name based on the const value. If the type name is
-              * "influx_fill_option", allow it to push down to remote without
-              * casting.
-              */
-             type_name = tdengine_get_data_type_name(node->consttype);
- 
-             if (strcmp(type_name, "influx_fill_enum") == 0)
-             {
-                 tdengine_deparse_fill_option(buf, extval);
-             }
-             else if (context->op_type != UNKNOWN_OPERATOR)
-             {
-                 switch (context->op_type)
-                 {
-                     case LIKE_OPERATOR:
-                     case NOT_LIKE_OPERATOR:
-                     case ILIKE_OPERATOR:
-                     case NOT_ILIKE_OPERATOR:
-                         /*
-                          * Convert LIKE's pattern on PostgreSQL to regex pattern on
-                          * InfluxDB.
-                          */
-                         tdengine_deparse_string_like_pattern(buf, extval, context->op_type);
-                         break;
-                     case REGEX_MATCH_CASE_SENSITIVE_OPERATOR:
-                     case REGEX_NOT_MATCH_CASE_SENSITIVE_OPERATOR:
-                     case REGEX_MATCH_CASE_INSENSITIVE_OPERATOR:
-                     case REGEX_NOT_MATCH_CASE_INSENSITIVE_OPERATOR:
-                         tdengine_deparse_string_regex_pattern(buf, extval, context->op_type);
-                         break;
-                     default:
-                         elog(ERROR, "OPERATOR is not supported");
-                         break;
-                 }
-             }
-             else
-             {
-                 tdengine_deparse_string_literal(buf, extval);
-             }
-             break;
-     }
- }
- 
- /*
-  * Deparse given Param node.
-  *
-  * If we're generating the query "for real", add the Param to
-  * context->params_list if it's not already present, and then use its index
-  * in that list as the remote parameter number.  During EXPLAIN, there's
-  * no need to identify a parameter number.
-  */
- static void
- tdengine_deparse_param(Param *node, deparse_expr_cxt *context)
- {
-     if (context->params_list)
-     {
-         int			pindex = 0;
-         ListCell   *lc;
- 
-         /* find its index in params_list */
-         foreach(lc, *context->params_list)
-         {
-             pindex++;
-             if (equal(node, (Node *) lfirst(lc)))
-                 break;
-         }
-         if (lc == NULL)
-         {
-             /* not in list, so add it */
-             pindex++;
-             *context->params_list = lappend(*context->params_list, node);
-         }
- 
-         tdengine_print_remote_param(pindex, node->paramtype, node->paramtypmod, context);
-     }
-     else
-     {
-         tdengine_print_remote_placeholder(node->paramtype, node->paramtypmod, context);
-     }
- }
- 
- /*
-  * This possible that name of function in PostgreSQL and
-  * InfluxDB differ, so return the InfluxDB equelent function name
-  */
- char *
- tdengine_replace_function(char *in)
- {
-     if (strcmp(in, "btrim") == 0)
-         return "trim";
-     else if (strcmp(in, "influx_count") == 0 || strcmp(in, "influx_count_all") == 0)
-         return "count";
-     else if (strcmp(in, "influx_distinct") == 0)
-         return "distinct";
-     else if (strcmp(in, "integral_all") == 0)
-         return "integral";
-     else if (strcmp(in, "mean_all") == 0)
-         return "mean";
-     else if (strcmp(in, "median_all") == 0)
-         return "median";
-     else if (strcmp(in, "influx_mode") == 0 || strcmp(in, "influx_mode_all") == 0)
-         return "mode";
-     else if (strcmp(in, "spread_all") == 0)
-         return "spread";
-     else if (strcmp(in, "stddev_all") == 0)
-         return "stddev";
-     else if (strcmp(in, "influx_sum") == 0 || strcmp(in, "influx_sum_all") == 0)
-         return "sum";
-     else if (strcmp(in, "first_all") == 0)
-         return "first";
-     else if (strcmp(in, "last_all") == 0)
-         return "last";
-     else if (strcmp(in, "influx_max") == 0 || strcmp(in, "influx_max_all") == 0)
-         return "max";
-     else if (strcmp(in, "influx_min") == 0 || strcmp(in, "influx_min_all") == 0)
-         return "min";
-     else if (strcmp(in, "percentile_all") == 0)
-         return "percentile";
-     else if (strcmp(in, "sample_all") == 0)
-         return "sample";
-     else if (strcmp(in, "abs_all") == 0)
-         return "abs";
-     else if (strcmp(in, "acos_all") == 0)
-         return "acos";
-     else if (strcmp(in, "asin_all") == 0)
-         return "asin";
-     else if (strcmp(in, "atan_all") == 0)
-         return "atan";
-     else if (strcmp(in, "atan2_all") == 0)
-         return "atan2";
-     else if (strcmp(in, "ceil_all") == 0)
-         return "ceil";
-     else if (strcmp(in, "cos_all") == 0)
-         return "cos";
-     else if (strcmp(in, "cumulative_sum_all") == 0)
-         return "cumulative_sum";
-     else if (strcmp(in, "derivative_all") == 0)
-         return "derivative";
-     else if (strcmp(in, "difference_all") == 0)
-         return "difference";
-     else if (strcmp(in, "elapsed_all") == 0)
-         return "elapsed";
-     else if (strcmp(in, "exp_all") == 0)
-         return "exp";
-     else if (strcmp(in, "floor_all") == 0)
-         return "floor";
-     else if (strcmp(in, "ln_all") == 0)
-         return "ln";
-     else if (strcmp(in, "log_all") == 0)
-         return "log";
-     else if (strcmp(in, "log2_all") == 0)
-         return "log2";
-     else if (strcmp(in, "log10_all") == 0)
-         return "log10";
-     else if (strcmp(in, "moving_average_all") == 0)
-         return "moving_average";
-     else if (strcmp(in, "non_negative_derivative_all") == 0)
-         return "non_negative_derivative";
-     else if (strcmp(in, "non_negative_difference_all") == 0)
-         return "non_negative_difference";
-     else if (strcmp(in, "pow_all") == 0)
-         return "pow";
-     else if (strcmp(in, "round_all") == 0)
-         return "round";
-     else if (strcmp(in, "sin_all") == 0)
-         return "sin";
-     else if (strcmp(in, "sqrt_all") == 0)
-         return "sqrt";
-     else if (strcmp(in, "tan_all") == 0)
-         return "tan";
-     else if (strcmp(in, "chande_momentum_oscillator_all") == 0)
-         return "chande_momentum_oscillator";
-     else if (strcmp(in, "exponential_moving_average_all") == 0)
-         return "exponential_moving_average";
-     else if (strcmp(in, "double_exponential_moving_average_all") == 0)
-         return "double_exponential_moving_average";
-     else if (strcmp(in, "kaufmans_efficiency_ratio_all") == 0)
-         return "kaufmans_efficiency_ratio";
-     else if (strcmp(in, "kaufmans_adaptive_moving_average_all") == 0)
-         return "kaufmans_adaptive_moving_average";
-     else if (strcmp(in, "triple_exponential_moving_average_all") == 0)
-         return "triple_exponential_moving_average";
-     else if (strcmp(in, "triple_exponential_derivative_all") == 0)
-         return "triple_exponential_derivative";
-     else if (strcmp(in, "relative_strength_index_all") == 0)
-         return "relative_strength_index";
-     else
-         return in;
- }
- 
- /*
-  * Deparse a function call.
-  */
- static void
- tdengine_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     char	   *proname;
-     bool		first;
-     ListCell   *arg;
-     bool		arg_swap = false;
-     bool		can_skip_cast = false;
-     bool		is_star_func = false;
-     List	   *args = node->args;
- 
-     /*
-      * Normal function: display as proname(args).
-      */
-     proname = get_func_name(node->funcid);
- 
-     /*
-      * fill() must go at the end of the GROUP BY clause if you are GROUP(ing)
-      * BY several things. At this stage saved the fill expression and not
-      * deparse
-      */
-     if (strcmp(proname, "influx_fill_numeric") == 0 ||
-         strcmp(proname, "influx_fill_option") == 0)
-     {
-         Assert(list_length(args) == 1);
-         /* Does not deparse this function in SELECT statement */
-         if (context->is_tlist)
-             return;
- 
-         /*
-          * "time(0d0h0m2s0u, " => "time(0d0h0m2s0u" fill() is consider as a
-          * parameter of time() and at this stage it has been deparsed ", " to
-          * prepare to not deparse fill() inside time function, reverse this
-          * action. Fill() will be saved and deparsed at the latter part GROUP
-          * BY expression.
-          */
-         buf->len = buf->len - 2;
- 
-         /* Store the fill() node to deparse later */
-         context->influx_fill_expr = node;
-         return;
-     }
- 
-     /* -----
-      * Convert time() function for influx
-      * "influx_time(time, interval '2h')" => "time(2h)"
-      * "influx_time(time, interval '2h', interval '1h')" => to "time(2h, 1h)"
-      * "influx_time(time, interval '2h', influx_fill_numeric(100))" => "time(2h) fill(100)"
-      * "influx_time(time, interval '2h', influx_fill_option('linear'))" => "time(2h) fill(linear)"
-      * "influx_time(time, interval '2h', interval '1h', influx_fill_numeric(100))" => "time(2h, 1h) fill(100)"
-      * "influx_time(time, interval '2h', interval '1h', influx_fill_option('linear'))" => "time(2h,1h) fill(linear)"
-      * ------
-      */
-     if (strcmp(proname, "influx_time") == 0)
-     {
-         int			idx = 0;
- 
-         Assert(list_length(args) == 2 ||
-                list_length(args) == 3 ||
-                list_length(args) == 4);
- 
-         if (context->is_tlist)
-             return;
- 
-         appendStringInfo(buf, "time(");
-         first = true;
-         foreach(arg, args)
-         {
-             if (idx == 0)
-             {
-                 /* Skip first parameter */
-                 idx++;
-                 continue;
-             }
-             if (idx >= 2)
-                 appendStringInfoString(buf, ", ");
- 
-             tdengine_deparse_expr((Expr *) lfirst(arg), context);
-             idx++;
-         }
-         appendStringInfoChar(buf, ')');
-         return;
-     }
- 
-     /* remove cast function if parent function is can handle without cast */
-     if (context->can_skip_cast == true &&
-         (strcmp(proname, "float8") == 0 || strcmp(proname, "numeric") == 0))
-     {
-         arg = list_head(args);
-         context->can_skip_cast = false;
-         tdengine_deparse_expr((Expr *) lfirst(arg), context);
-         return;
-     }
- 
-     if (strcmp(proname, "log") == 0)
-     {
-         arg_swap = true;
-     }
- 
-     /* inner function can skip cast if any */
-     if (tdengine_is_unique_func(node->funcid, proname) ||
-         tdengine_is_supported_builtin_func(node->funcid, proname))
-         can_skip_cast = true;
- 
-     is_star_func = tdengine_is_star_func(node->funcid, proname);
-     /* Translate PostgreSQL function into InfluxDB function */
-     proname = tdengine_replace_function(proname);
- 
-     /* Deparse the function name ... */
-     appendStringInfo(buf, "%s(", proname);
- 
-     /* swap arguments */
-     if (arg_swap && list_length(args) == 2)
-     {
-         args = list_make2(lfirst(list_tail(args)), lfirst(list_head(args)));
-     }
- 
-     /* ... and all the arguments */
-     first = true;
- 
-     if (is_star_func)
-     {
-         appendStringInfoChar(buf, '*');
-         first = false;
-     }
-     foreach(arg, args)
-     {
-         Expr	   *exp = (Expr *) lfirst(arg);
- 
-         if (!first)
-             appendStringInfoString(buf, ", ");
- 
-         if (IsA((Node *) exp, Const))
-         {
-             Const	   *arg = (Const *) exp;
-             char	   *extval;
- 
-             if (arg->consttype == TEXTOID)
-             {
-                 bool		is_regex = tdengine_is_regex_argument(arg, &extval);
- 
-                 /* Append regex */
-                 if (is_regex == true)
-                 {
-                     appendStringInfo(buf, "%s", extval);
-                     first = false;
-                     continue;
-                 }
-             }
-         }
- 
-         if (can_skip_cast)
-             context->can_skip_cast = true;
-         tdengine_deparse_expr((Expr *) exp, context);
-         first = false;
-     }
-     appendStringInfoChar(buf, ')');
- }
- 
- /*
-  * Deparse given operator expression.  To avoid problems around
-  * priority of operations, we always parenthesize the arguments.
-  */
- static void
- tdengine_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     HeapTuple	tuple;
-     Form_pg_operator form;
-     char		oprkind;
-     InfluxDBFdwRelationInfo *fpinfo =
-         (InfluxDBFdwRelationInfo *)(context->foreignrel->fdw_private);
- 
-     RangeTblEntry *rte = planner_rt_fetch(context->scanrel->relid, context->root);
- 
-     /* Retrieve information about the operator from system catalog. */
-     tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(node->opno));
-     if (!HeapTupleIsValid(tuple))
-         elog(ERROR, "cache lookup failed for operator %u", node->opno);
-     form = (Form_pg_operator) GETSTRUCT(tuple);
-     oprkind = form->oprkind;
- 
-     /* Sanity check. */
-     Assert((oprkind == 'l' && list_length(node->args) == 1) ||
-            (oprkind == 'b' && list_length(node->args) == 2));
- 
-     /* Check schemaless var */
-     if (tdengine_is_slvar_fetch((Node *)node, &(fpinfo->slinfo)))
-     {
-         tdengine_deparse_slvar((Node *)node, linitial_node(Var, node->args), lsecond_node(Const, node->args), context);
-         ReleaseSysCache(tuple);
-         return;
-     }
- 
-     if (oprkind == 'b' &&
-         tdengine_contain_time_key_column(rte->relid, node->args))
-     {
-         context->convert_to_timestamp = true;
-     }
- 
-     /* Always parenthesize the expression. */
-     appendStringInfoChar(buf, '(');
- 
-     /* Deparse left operand, if any. */
-     if (oprkind == 'b')
-     {
-         tdengine_deparse_expr(linitial(node->args), context);
-         appendStringInfoChar(buf, ' ');
-     }
- 
-     /* Deparse operator name. */
-     tdengine_deparse_operator_name(buf, form, &context->op_type);
- 
-     /* Deparse right operand. */
-     appendStringInfoChar(buf, ' ');
- 
-     tdengine_deparse_expr(llast(node->args), context);
- 
-     /* Reset pattern matching operator type for next operation */
-     context->op_type = UNKNOWN_OPERATOR;
- 
-     appendStringInfoChar(buf, ')');
- 
-     ReleaseSysCache(tuple);
- }
- 
- /*
-  * Print the name of an operator.
-  */
- static void
- tdengine_deparse_operator_name(StringInfo buf, Form_pg_operator opform, PatternMatchingOperator *op_type)
- {
-     /* opname is not a SQL identifier, so we should not quote it. */
-     cur_opname = NameStr(opform->oprname);
-     *op_type = UNKNOWN_OPERATOR;
- 
-     /* Print schema name only if it's not pg_catalog */
-     if (opform->oprnamespace != PG_CATALOG_NAMESPACE)
-     {
-         const char *opnspname;
- 
-         opnspname = get_namespace_name(opform->oprnamespace);
-         /* Print fully qualified operator name. */
-         appendStringInfo(buf, "OPERATOR(%s.%s)",
-                          tdengine_quote_identifier(opnspname, QUOTE), cur_opname);
-     }
-     else
-     {
-         if (strcmp(cur_opname, "~~") == 0)
-         {
-             appendStringInfoString(buf, "=~");
-             *op_type = LIKE_OPERATOR;
-         }
-         else if (strcmp(cur_opname, "!~~") == 0)
-         {
-             appendStringInfoString(buf, "!~");
-             *op_type = NOT_LIKE_OPERATOR;
-         }
-         else if (strcmp(cur_opname, "~~*") == 0)
-         {
-             appendStringInfoString(buf, "=~");
-             *op_type = ILIKE_OPERATOR;
-         }
-         else if (strcmp(cur_opname, "!~~*") == 0)
-         {
-             appendStringInfoString(buf, "!~");
-             *op_type = NOT_ILIKE_OPERATOR;
-         }
-         else if (strcmp(cur_opname, "~") == 0)
-         {
-             appendStringInfoString(buf, "=~");
-             *op_type = REGEX_MATCH_CASE_SENSITIVE_OPERATOR;
-         }
-         else if (strcmp(cur_opname, "!~") == 0)
-         {
-             appendStringInfoString(buf, "!~");
-             *op_type = REGEX_NOT_MATCH_CASE_SENSITIVE_OPERATOR;
-         }
-         else if (strcmp(cur_opname, "~*") == 0)
-         {
-             appendStringInfoString(buf, "=~");
-             *op_type = REGEX_MATCH_CASE_INSENSITIVE_OPERATOR;
-         }
-         else if (strcmp(cur_opname, "!~*") == 0)
-         {
-             appendStringInfoString(buf, "!~");
-             *op_type = REGEX_NOT_MATCH_CASE_INSENSITIVE_OPERATOR;
-         }
-         else
-         {
-             appendStringInfoString(buf, cur_opname);
-         }
-     }
- }
- 
- /*
-  * Deparse given ScalarArrayOpExpr expression.  To avoid problems
-  * around priority of operations, we always parenthesize the arguments.
-  * InfluxDB does not support IN,
-  * so conditions concatenated by OR will be created.
-  * expr IN (c1, c2, c3) => expr == c1 OR expr == c2 OR expr == c3
-  * expr NOT IN (c1, c2, c3) => expr <> c1 AND expr <> c2 AND expr <> c3
-  */
- static void
- tdengine_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     HeapTuple	tuple;
-     Expr	   *arg1;
-     Expr	   *arg2;
-     Form_pg_operator form;
-     char	   *opname = NULL;
-     Oid			typoutput;
-     bool		typIsVarlena;
- 
-     /* Retrieve information about the operator from system catalog. */
-     tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(node->opno));
-     if (!HeapTupleIsValid(tuple))
-         elog(ERROR, "cache lookup failed for operator %u", node->opno);
-     form = (Form_pg_operator) GETSTRUCT(tuple);
- 
-     /* Sanity check. */
-     Assert(list_length(node->args) == 2);
- 
-     opname = pstrdup(NameStr(form->oprname));
-     ReleaseSysCache(tuple);
- 
-     /* Get left and right argument for deparsing */
-     arg1 = linitial(node->args);
-     arg2 = lsecond(node->args);
-     switch (nodeTag((Node *) arg2))
-     {
-         case T_Const:
-             {
-                 char	   *extval;
-                 Const	   *c;
-                 bool		isstr;
-                 const char *valptr;
-                 int			i = -1;
-                 bool		deparseLeft = true;
-                 bool		inString = false;
-                 bool		isEscape = false;
- 
-                 c = (Const *) arg2;
-                 if (!c->constisnull)
-                 {
-                     getTypeOutputInfo(c->consttype,
-                                       &typoutput, &typIsVarlena);
-                     extval = OidOutputFunctionCall(typoutput, c->constvalue);
-                     switch (c->consttype)
-                     {
-                         case BOOLARRAYOID:
-                         case INT8ARRAYOID:
-                         case INT2ARRAYOID:
-                         case INT4ARRAYOID:
-                         case OIDARRAYOID:
-                         case FLOAT4ARRAYOID:
-                         case FLOAT8ARRAYOID:
-                             isstr = false;
-                             break;
-                         default:
-                             isstr = true;
-                             break;
-                     }
- 
-                     /* Deparse right operand. */
-                     for (valptr = extval; *valptr; valptr++)
-                     {
-                         char		ch = *valptr;
- 
-                         i++;
- 
-                         /* Deparse left operand. */
-                         if (deparseLeft)
-                         {
-                             if (c->consttype == BOOLARRAYOID)
-                             {
-                                 if (arg1 != NULL && IsA(arg1, Var))
-                                 {
-                                     Var		   *var = (Var *) arg1;
- 
-                                     /*
-                                      * Deparse bool column with convert
-                                      * argument is false
-                                      */
-                                     tdengine_deparse_column_ref(buf, var->varno, var->varattno, var->vartype, context->root, false, false);
-                                 }
-                                 else if (arg1 != NULL && IsA(arg1, CoerceViaIO))
-                                 {
-                                     bool has_bool_cmp = context->has_bool_cmp;
- 
-                                     context->has_bool_cmp = false;
-                                     tdengine_deparse_expr(arg1, context);
-                                     context->has_bool_cmp = has_bool_cmp;
-                                 }
-                             }
-                             else
-                             {
-                                 tdengine_deparse_expr(arg1, context);
-                             }
- 
-                             /* Append operator */
-                             appendStringInfo(buf, " %s ", opname);
- 
-                             if (isstr)
-                                 appendStringInfoChar(buf, '\'');
-                             deparseLeft = false;
-                         }
- 
-                         if ((ch == '{' && i == 0) || (ch == '}' && (i == (strlen(extval) - 1))))
-                             continue;
- 
-                         /* Remove '\"' and process the next character. */
-                         if (ch == '\"' && !isEscape)
-                         {
-                             inString = !inString;
-                             continue;
-                         }
-                         /* Add escape character '\'' for '\'' */
-                         if (ch == '\'')
-                             appendStringInfoChar(buf, '\'');
- 
-                         /*
-                          * Remove character '\\' and process the next
-                          * character.
-                          */
-                         if (ch == '\\' && !isEscape)
-                         {
-                             isEscape = true;
-                             continue;
-                         }
-                         isEscape = false;
- 
-                         if (ch == ',' && !inString)
-                         {
-                             if (isstr)
-                                 appendStringInfoChar(buf, '\'');
- 
-                             if (node->useOr)
-                                 appendStringInfo(buf, " OR ");
-                             else
-                                 appendStringInfo(buf, " AND ");
- 
-                             deparseLeft = true;
-                             continue;
-                         }
- 
-                         /*
-                          * InfluxDB only supports "= true" or "= false" (not
-                          * "= 't'"" or "= 'f'")
-                          */
-                         if (c->consttype == BOOLARRAYOID)
-                         {
-                             if (ch == 't')
-                                 appendStringInfo(buf, "true");
-                             else
-                                 appendStringInfo(buf, "false");
-                             continue;
-                         }
-                         appendStringInfoChar(buf, ch);
-                     }
-                     if (isstr)
-                         appendStringInfoChar(buf, '\'');
-                 }
-                 break;
-             }
-         case T_ArrayExpr:
-             {
-                 bool		first = true;
-                 ListCell   *lc;
- 
-                 foreach(lc, ((ArrayExpr *) arg2)->elements)
-                 {
-                     if (!first)
-                     {
-                         if (node->useOr)
-                             appendStringInfoString(buf, " OR ");
-                         else
-                             appendStringInfoString(buf, " AND ");
-                     }
- 
-                     /* deparse left argument */
-                     appendStringInfoChar(buf, '(');
-                     tdengine_deparse_expr(arg1, context);
- 
-                     appendStringInfo(buf, " %s ", opname);
- 
-                     /* deparse each element in right argument sequentially */
-                     tdengine_deparse_expr(lfirst(lc), context);
-                     appendStringInfoChar(buf, ')');
- 
-                     first = false;
-                 }
-                 break;
-             }
-         default:
-             elog(ERROR, "unsupported expression type for deparse: %d", (int) nodeTag(node));
-             break;
-     }
- }
- 
- /*
-  * Deparse a RelabelType (binary-compatible cast) node.
-  */
- static void
- tdengine_deparse_relabel_type(RelabelType *node, deparse_expr_cxt *context)
- {
-     tdengine_deparse_expr(node->arg, context);
- }
- 
- /*
-  * Deparse a BoolExpr node.
-  *
-  * Note: by the time we get here, AND and OR expressions have been flattened
-  * into N-argument form, so we'd better be prepared to deal with that.
-  */
- static void
- tdengine_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     const char *op = NULL;		/* keep compiler quiet */
-     bool		first;
-     ListCell   *lc;
- 
-     switch (node->boolop)
-     {
-         case AND_EXPR:
-             op = "AND";
-             break;
-         case OR_EXPR:
-             op = "OR";
-             break;
-         case NOT_EXPR:
-             appendStringInfoString(buf, "(NOT ");
-             tdengine_deparse_expr(linitial(node->args), context);
-             appendStringInfoChar(buf, ')');
-             return;
-     }
- 
-     appendStringInfoChar(buf, '(');
-     first = true;
-     foreach(lc, node->args)
-     {
-         if (!first)
-             appendStringInfo(buf, " %s ", op);
-         tdengine_deparse_expr((Expr *) lfirst(lc), context);
-         first = false;
-     }
-     appendStringInfoChar(buf, ')');
- }
- 
- /*
-  * Deparse IS [NOT] NULL expression.
-  */
- static void
- tdengine_deparse_null_test(NullTest *node, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
- 
-     appendStringInfoChar(buf, '(');
-     tdengine_deparse_expr(node->arg, context);
-     if (node->nulltesttype == IS_NULL)
-         appendStringInfoString(buf, " = '')");
-     else
-         appendStringInfoString(buf, " <> '')");
- }
- 
- /*
-  * Deparse ARRAY[...] construct.
-  */
- static void
- tdengine_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     bool		first = true;
-     ListCell   *lc;
- 
-     appendStringInfoString(buf, "ARRAY[");
-     foreach(lc, node->elements)
-     {
-         if (!first)
-             appendStringInfoString(buf, ", ");
-         tdengine_deparse_expr(lfirst(lc), context);
-         first = false;
-     }
-     appendStringInfoChar(buf, ']');
- }
- 
- /*
-  * Print the representation of a parameter to be sent to the remote side.
-  *
-  * Note: we always label the Param's type explicitly rather than relying on
-  * transmitting a numeric type OID in PQexecParams().  This allows us to
-  * avoid assuming that types have the same OIDs on the remote side as they
-  * do locally --- they need only have the same names.
-  */
- static void
- tdengine_print_remote_param(int paramindex, Oid paramtype, int32 paramtypmod,
-                             deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
- 
-     appendStringInfo(buf, "$%d", paramindex);
- }
- 
- /*
-  * Print the representation of a placeholder for a parameter that will be
-  * sent to the remote side at execution time.
-  *
-  * This is used when we're just trying to EXPLAIN the remote query.
-  * We don't have the actual value of the runtime parameter yet, and we don't
-  * want the remote planner to generate a plan that depends on such a value
-  * anyway.  Thus, we can't do something simple like "$1::paramtype".
-  */
- static void
- tdengine_print_remote_placeholder(Oid paramtype, int32 paramtypmod,
-                                   deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
- 
-     appendStringInfo(buf, "(SELECT null)");
- }
- 
- /*
-  * Return true if given object is one of PostgreSQL's built-in objects.
-  *
-  * We use FirstBootstrapObjectId as the cutoff, so that we only consider
-  * objects with hand-assigned OIDs to be "built in", not for instance any
-  * function or type defined in the information_schema.
-  *
-  * Our constraints for dealing with types are tighter than they are for
-  * functions or operators: we want to accept only types that are in pg_catalog,
-  * else format_type might incorrectly fail to schema-qualify their names.
-  * (This could be fixed with some changes to format_type, but for now there's
-  * no need.)  Thus we must exclude information_schema types.
-  *
-  * XXX there is a problem with this, which is that the set of built-in
-  * objects expands over time.  Something that is built-in to us might not
-  * be known to the remote server, if it's of an older version.  But keeping
-  * track of that would be a huge exercise.
-  */
- bool
- tdengine_is_builtin(Oid oid)
- {
- #if (PG_VERSION_NUM >= 120000)
-     return (oid < FirstGenbkiObjectId);
- #else
-     return (oid < FirstBootstrapObjectId);
- #endif
- }
- 
- bool
- tdengine_is_regex_argument(Const *node, char **extval)
- {
-     Oid			typoutput;
-     bool		typIsVarlena;
-     const char *first;
-     const char *last;
- 
-     getTypeOutputInfo(node->consttype,
-                       &typoutput, &typIsVarlena);
- 
-     (*extval) = OidOutputFunctionCall(typoutput, node->constvalue);
-     first = *extval;
-     last = *extval + strlen(*extval) - 1;
-     /* Append regex */
-     if (*first == '/' && *last == '/')
-         return true;
-     else
-         return false;
- }
- 
- /*
-  * Check if it is necessary to add a star(*) as the 1st argument
-  */
- bool
- tdengine_is_star_func(Oid funcid, char *in)
- {
-     char	   *eof = "_all";	/* End of function should be "_all" */
-     size_t		func_len = strlen(in);
-     size_t		eof_len = strlen(eof);
- 
-     if (tdengine_is_builtin(funcid))
-         return false;
- 
-     if (func_len > eof_len && strcmp(in + func_len - eof_len, eof) == 0 &&
-         exist_in_function_list(in, InfluxDBStableStarFunction))
-         return true;
- 
-     return false;
- }
- 
- static bool
- tdengine_is_unique_func(Oid funcid, char *in)
- {
-     if (tdengine_is_builtin(funcid))
-         return false;
- 
-     if (exist_in_function_list(in, InfluxDBUniqueFunction))
-         return true;
- 
-     return false;
- }
- 
- static bool
- tdengine_is_supported_builtin_func(Oid funcid, char *in)
- {
-     if (!tdengine_is_builtin(funcid))
-         return false;
- 
-     if (exist_in_function_list(in, InfluxDBSupportedBuiltinFunction))
-         return true;
- 
-     return false;
- }
- 
- /*
-  * Deparse an Aggref node.
-  */
- static void
- tdengine_deparse_aggref(Aggref *node, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     bool		use_variadic;
-     char	   *func_name;
-     bool		is_star_func;
- 
-     /* Only basic, non-split aggregation accepted. */
-     Assert(node->aggsplit == AGGSPLIT_SIMPLE);
- 
-     /* Check if need to print VARIADIC (cf. ruleutils.c) */
-     use_variadic = node->aggvariadic;
- 
-     /* Find aggregate name from aggfnoid which is a pg_proc entry */
-     func_name = get_func_name(node->aggfnoid);
- 
-     if (!node->aggstar)
-     {
-         if ((strcmp(func_name, "last") == 0 || strcmp(func_name, "first") == 0) && list_length(node->args) == 2)
-         {
-             /* Convert func(time, value) to func(value) */
-             Assert(list_length(node->args) == 2);
-             appendStringInfo(buf, "%s(", func_name);
-             tdengine_deparse_expr((Expr *) (((TargetEntry *) list_nth(node->args, 1))->expr), context);
-             appendStringInfoChar(buf, ')');
-             return;
-         }
-     }
- 
-     is_star_func = tdengine_is_star_func(node->aggfnoid, func_name);
-     func_name = tdengine_replace_function(func_name);
-     appendStringInfo(buf, "%s", func_name);
- 
-     appendStringInfoChar(buf, '(');
- 
-     /* Add DISTINCT */
-     appendStringInfo(buf, "%s", (node->aggdistinct != NIL) ? "DISTINCT " : "");
- 
-     /* aggstar can be set only in zero-argument aggregates */
-     if (node->aggstar)
-         appendStringInfoChar(buf, '*');
-     else
-     {
-         ListCell   *arg;
-         bool		first = true;
- 
-         if (is_star_func)
-         {
-             appendStringInfoChar(buf, '*');
-             first = false;
-         }
- 
-         /* Add all the arguments */
-         foreach(arg, node->args)
-         {
-             TargetEntry *tle = (TargetEntry *) lfirst(arg);
-             Node	   *n = (Node *) tle->expr;
- 
-             if (IsA(n, Const))
-             {
-                 Const	   *arg = (Const *) n;
-                 char	   *extval;
- 
-                 if (arg->consttype == TEXTOID)
-                 {
-                     bool		is_regex = tdengine_is_regex_argument(arg, &extval);
- 
-                     /* Append regex */
-                     if (is_regex == true)
-                     {
-                         appendStringInfo(buf, "%s", extval);
-                         first = false;
-                         continue;
-                     }
- 
-                 }
-             }
- 
-             if (tle->resjunk)
-                 continue;
- 
-             if (!first)
-                 appendStringInfoString(buf, ", ");
-             first = false;
- 
-             /* Add VARIADIC */
- #if (PG_VERSION_NUM >= 130000)
-             if (use_variadic && lnext(node->args, arg) == NULL)
- #else
-             if (use_variadic && lnext(arg) == NULL)
- #endif
-                 appendStringInfoString(buf, "VARIADIC ");
- 
-             tdengine_deparse_expr((Expr *) n, context);
-         }
-     }
- 
-     appendStringInfoChar(buf, ')');
- }
- 
- /*
-  * Deparse GROUP BY clause.
-  */
- static void
- tdengine_append_group_by_clause(List *tlist, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     Query	   *query = context->root->parse;
-     ListCell   *lc;
-     bool		first = true;
- 
-     /* Nothing to be done, if there's no GROUP BY clause in the query. */
-     if (!query->groupClause)
-         return;
- 
-     appendStringInfo(buf, " GROUP BY ");
- 
-     /*
-      * Queries with grouping sets are not pushed down, so we don't expect
-      * grouping sets here.
-      */
-     Assert(!query->groupingSets);
- 
-     context->influx_fill_expr = NULL;
-     /*
-      * We intentionally print query->groupClause not processed_groupClause,
-      * leaving it to the remote planner to get rid of any redundant GROUP BY
-      * items again.  This is necessary in case processed_groupClause reduced
-      * to empty, and in any case the redundancy situation on the remote might
-      * be different than what we think here.
-      */
-     foreach(lc, query->groupClause)
-     {
-         SortGroupClause *grp = (SortGroupClause *) lfirst(lc);
- 
-         if (!first)
-             appendStringInfoString(buf, ", ");
-         first = false;
- 
-         tdengine_deparse_sort_group_clause(grp->tleSortGroupRef, tlist, context);
-     }
- 
-     /* Append fill() function in the last position of GROUP BY clause if have */
-     if (context->influx_fill_expr)
-     {
-         ListCell   *arg;
- 
-         appendStringInfo(buf, " fill(");
- 
-         foreach(arg, context->influx_fill_expr->args)
-         {
-             tdengine_deparse_expr((Expr *) lfirst(arg), context);
-         }
- 
-         appendStringInfoChar(buf, ')');
-     }
- }
- 
- /*
-  * Deparse LIMIT/OFFSET clause.
-  */
- static void
- tdengine_append_limit_clause(deparse_expr_cxt *context)
- {
-     PlannerInfo *root = context->root;
-     StringInfo	buf = context->buf;
-     int			nestlevel;
- 
-     /* Make sure any constants in the exprs are printed portably */
-     nestlevel = tdengine_set_transmission_modes();
- 
-     if (root->parse->limitCount)
-     {
-         appendStringInfoString(buf, " LIMIT ");
-         tdengine_deparse_expr((Expr *) root->parse->limitCount, context);
-     }
-     if (root->parse->limitOffset)
-     {
-         appendStringInfoString(buf, " OFFSET ");
-         tdengine_deparse_expr((Expr *) root->parse->limitOffset, context);
-     }
- 
-     tdengine_reset_transmission_modes(nestlevel);
- }
- 
- /*
-  * Find an equivalence class member expression, all of whose Vars, come from
-  * the indicated relation.
-  */
- static Expr *
- tdengine_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
- {
-     ListCell   *lc_em;
- 
-     foreach(lc_em, ec->ec_members)
-     {
-         EquivalenceMember *em = lfirst(lc_em);
- 
-         if (bms_is_subset(em->em_relids, rel->relids))
-         {
-             /*
-              * If there is more than one equivalence member whose Vars are
-              * taken entirely from this relation, we'll be content to choose
-              * any one of those.
-              */
-             return em->em_expr;
-         }
-     }
- 
-     /* We didn't find any suitable equivalence class expression */
-     return NULL;
- }
- 
- /*
-  * Deparse ORDER BY clause according to the given pathkeys for given base
-  * relation. From given pathkeys expressions belonging entirely to the given
-  * base relation are obtained and deparsed.
-  */
- static void
- tdengine_append_order_by_clause(List *pathkeys, deparse_expr_cxt *context)
- {
-     ListCell   *lcell;
-     int			nestlevel;
-     char	   *delim = " ";
-     RelOptInfo *baserel = context->scanrel;
-     StringInfo	buf = context->buf;
- 
-     /* Make sure any constants in the exprs are printed portably */
-     nestlevel = tdengine_set_transmission_modes();
- 
-     appendStringInfo(buf, " ORDER BY");
-     foreach(lcell, pathkeys)
-     {
-         PathKey    *pathkey = lfirst(lcell);
-         Expr	   *em_expr;
- 
-         em_expr = tdengine_find_em_expr_for_rel(pathkey->pk_eclass, baserel);
-         Assert(em_expr != NULL);
- 
-         appendStringInfoString(buf, delim);
-         tdengine_deparse_expr(em_expr, context);
-         if (pathkey->pk_strategy == BTLessStrategyNumber)
-             appendStringInfoString(buf, " ASC");
-         else
-             appendStringInfoString(buf, " DESC");
- 
-         if (pathkey->pk_nulls_first)
-             elog(ERROR, "NULLS FIRST not supported");
-         delim = ", ";
-     }
-     tdengine_reset_transmission_modes(nestlevel);
- }
- 
- /*
-  * tdengine_get_data_type_name
-  *		Deparses data type name from given data type oid.
-  */
- char *
- tdengine_get_data_type_name(Oid data_type_id)
- {
-     HeapTuple	tuple;
-     Form_pg_type type;
-     char	   *type_name;
- 
-     tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(data_type_id));
-     if (!HeapTupleIsValid(tuple))
-         elog(ERROR, "cache lookup failed for data type id %u", data_type_id);
-     type = (Form_pg_type) GETSTRUCT(tuple);
-     /* Always print the data type name */
-     type_name = pstrdup(type->typname.data);
-     ReleaseSysCache(tuple);
-     return type_name;
- }
- 
- /*
-  * Appends a sort or group clause.
-  *
-  * Like get_rule_sortgroupclause(), returns the expression tree, so caller
-  * need not find it again.
-  */
- static Node *
- tdengine_deparse_sort_group_clause(Index ref, List *tlist, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     TargetEntry *tle;
-     Expr	   *expr;
- 
-     tle = get_sortgroupref_tle(ref, tlist);
-     expr = tle->expr;
- 
-     if (expr && IsA(expr, Const))
-     {
-         /*
-          * Force a typecast here so that we don't emit something like "GROUP
-          * BY 2", which will be misconstrued as a column position rather than
-          * a constant.
-          */
-         tdengine_deparse_const((Const *) expr, context, 1);
-     }
-     else if (!expr || IsA(expr, Var))
-         tdengine_deparse_expr(expr, context);
-     else
-     {
-         /* Always parenthesize the expression. */
-         appendStringInfoString(buf, "(");
-         tdengine_deparse_expr(expr, context);
-         appendStringInfoString(buf, ")");
-     }
- 
-     return (Node *) expr;
- }
- 
- /*
-  * At least one element in the list is time column
-  * tdengine_contain_time_column function returns true.
-  */
- static bool
- tdengine_contain_time_column(List *exprs, schemaless_info *pslinfo)
- {
-     ListCell   *lc;
- 
-     foreach(lc, exprs)
-     {
-         Expr	*expr = (Expr *) lfirst(lc);
- 
-         if (IsA(expr, Var))
-         {
-             Var *var = (Var *)expr;
- 
-             if (INFLUXDB_IS_TIME_TYPE(var->vartype))
-             {
-                 return true;
-             }
-         }
-         else if (IsA(expr, CoerceViaIO))
-         {
-             CoerceViaIO *cio = (CoerceViaIO *) expr;
-             Node *arg = (Node *)cio->arg;
- 
-             if (tdengine_is_slvar_fetch(arg, pslinfo))
-             {
-                 if (INFLUXDB_IS_TIME_TYPE(cio->resulttype))
-                 {
-                     return true;
-                 }
-             }
-         }
-     }
- 
-     return false;
- }
- 
- /*
-  * At least one element in the list is time key column
-  */
- static bool
- tdengine_contain_time_key_column(Oid relid, List *exprs)
- {
-     ListCell *lc;
- 
-     foreach (lc, exprs)
-     {
-         Expr *expr = (Expr *)lfirst(lc);
-         Var *var;
- 
-         if (!IsA(expr, Var))
-             continue;
- 
-         var = (Var *)expr;
- 
-         if (INFLUXDB_IS_TIME_TYPE(var->vartype))
-         {
-             char *column_name = tdengine_get_column_name(relid, var->varattno);
- 
-             if (INFLUXDB_IS_TIME_COLUMN(column_name))
-                 return true;
-         }
-     }
- 
-     return false;
- }
- 
- /*
-  * At least one element in the list is time expression except Var, Const, Param, FuncExpr.
-  */
- static bool
- tdengine_contain_time_expr(List *exprs)
- {
-     ListCell *lc;
- 
-     foreach (lc, exprs)
-     {
-         Expr *expr = (Expr *)lfirst(lc);
-         Oid type;
- 
-         if (IsA(expr, Var) ||
-             IsA(expr, Const) ||
-             IsA(expr, Param) ||
-             IsA(expr, FuncExpr))
-         {
-             continue;
-         }
- 
-         type = exprType((Node *)expr);
- 
-         if (INFLUXDB_IS_TIME_TYPE(type))
-         {
-             return true;
-         }
-     }
-     return false;
- }
- 
- /*
-  * At least one element in the list is time function
-  */
- static bool
- tdengine_contain_time_function(List *exprs)
- {
-     ListCell *lc;
- 
-     foreach (lc, exprs)
-     {
-         Expr *expr = (Expr *)lfirst(lc);
-         FuncExpr *func_expr;
- 
-         if (!IsA(expr, FuncExpr))
-             continue;
- 
-         func_expr = (FuncExpr *)expr;
- 
-         if (INFLUXDB_IS_TIME_TYPE(func_expr->funcresulttype))
-         {
-             return true;
-         }
-     }
-     return false;
- }
- 
- /*
-  * At least one element in the list is time param
-  */
- static bool
- tdengine_contain_time_param(List *exprs)
- {
-     ListCell *lc;
- 
-     foreach (lc, exprs)
-     {
-         Expr *expr = (Expr *)lfirst(lc);
-         Oid type;
- 
-         if (!IsA(expr, Param))
-             continue;
- 
-         type = exprType((Node *)expr);
- 
-         if (INFLUXDB_IS_TIME_TYPE(type))
-         {
-             return true;
-         }
-     }
- 
-     return false;
- }
- 
- /*
-  * At least one element in the list is time const
-  */
- static bool
- tdengine_contain_time_const(List *exprs)
- {
-     ListCell *lc;
- 
-     foreach (lc, exprs)
-     {
-         Expr *expr = (Expr *)lfirst(lc);
-         Oid type;
- 
-         if (!IsA(expr, Const))
-             continue;
- 
-         type = exprType((Node *)expr);
- 
-         if (INFLUXDB_IS_TIME_TYPE(type))
-         {
-             return true;
-         }
-     }
- 
-     return false;
- }
- 
- /*
-  * tdengine_is_grouping_target
-  * This function check whether given target entry is grouping target,
-  * if so, return true, otherwise return false.
-  */
- bool
- tdengine_is_grouping_target(TargetEntry *tle, Query *query)
- {
-     ListCell   *lc;
- 
-     /* Nothing to be done, if there's no GROUP BY clause in the query. */
-     if (!query->groupClause)
-         return false;
- 
-     foreach(lc, query->groupClause)
-     {
-         SortGroupClause *grp = (SortGroupClause *) lfirst(lc);
- 
-         /* Check whether target entry is a grouping target or not */
-         if (grp->tleSortGroupRef == tle->ressortgroupref)
-         {
-             return true;
-         }
-     }
- 
-     return false;
- }
- 
- /*
-  * tdengine_append_field_key
-  * This function finds field key and the first found field key will be added into buf.
-  */
- void
- tdengine_append_field_key(TupleDesc tupdesc, StringInfo buf, Index rtindex, PlannerInfo *root, bool first)
- {
-     int			i;
- 
-     for (i = 1; i <= tupdesc->natts; i++)
-     {
-         Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
-         RangeTblEntry *rte = planner_rt_fetch(rtindex, root);
-         char	   *name = tdengine_get_column_name(rte->relid, i);
- 
-         /* Ignore dropped attributes. */
-         if (attr->attisdropped)
-             continue;
- 
-         /* Skip if column is time and tag key */
-         if (!INFLUXDB_IS_TIME_COLUMN(name) && !tdengine_is_tag_key(name, rte->relid))
-         {
-             if (!first)
-                 appendStringInfoString(buf, ", ");
-             tdengine_deparse_column_ref(buf, rtindex, i, -1, root, false, false);
-             return;
-         }
-     }
- }
- 
- /*
-  * tdengine_get_table_name
-  * This function return name of table.
-  */
- char *
- tdengine_get_table_name(Relation rel)
- {
-     ForeignTable *table;
-     char	   *relname = NULL;
-     ListCell   *lc = NULL;
- 
-     /* obtain additional catalog information. */
-     table = GetForeignTable(RelationGetRelid(rel));
- 
-     /*
-      * Use value of FDW options if any, instead of the name of object itself.
-      */
-     foreach(lc, table->options)
-     {
-         DefElem    *def = (DefElem *) lfirst(lc);
- 
-         if (strcmp(def->defname, "table") == 0)
-             relname = defGetString(def);
-     }
- 
-     if (relname == NULL)
-         relname = RelationGetRelationName(rel);
- 
-     return relname;
- }
- 
- /*
-  * tdengine_get_column_name
-  * This function return name of column.
-  */
- char *
- tdengine_get_column_name(Oid relid, int attnum)
- {
-     List	   *options = NULL;
-     ListCell   *lc_opt;
-     char	   *colname = NULL;
- 
-     options = GetForeignColumnOptions(relid, attnum);
- 
-     foreach(lc_opt, options)
-     {
-         DefElem    *def = (DefElem *) lfirst(lc_opt);
- 
-         if (strcmp(def->defname, "column_name") == 0)
-         {
-             colname = defGetString(def);
-             break;
-         }
-     }
- 
-     if (colname == NULL)
-         colname = get_attname(relid, attnum
- #if (PG_VERSION_NUM >= 110000)
-                               ,
-                               false
- #endif
-             );
-     return colname;
- }
- 
- /*
-  * tdengine_is_tag_key
-  * This function check whether column is tag key or not.
-  * Return true if it is tag, otherwise return false.
-  */
- bool
- tdengine_is_tag_key(const char *colname, Oid reloid)
- {
-     tdengine_opt *options;
-     ListCell   *lc;
- 
-     /* Get FDW options */
-     options = tdengine_get_options(reloid, GetUserId());
- 
-     /* If there is no tag in "tags" option, it means column is field */
-     if (!options->tags_list)
-         return false;
- 
-     /* Check whether column is tag or not */
-     foreach(lc, options->tags_list)
-     {
-         char	   *name = (char *) lfirst(lc);
- 
-         if (strcmp(colname, name) == 0)
-             return true;
-     }
- 
-     return false;
- }
- 
- /*****************************************************************************
-  *		Check clauses for functions
-  *****************************************************************************/
- 
- /*
-  * tdengine_contain_functions_walker
-  *	  Recursively search for functions within a clause.
-  *
-  * Returns true if any function (or operator implemented by function) is found.
-  *
-  * We will recursively look into TargetEntry exprs.
-  */
- static bool
- tdengine_contain_functions_walker(Node *node, void *context)
- {
-     if (node == NULL)
-         return false;
-     /* Check for functions in node itself */
-     if (nodeTag(node) == T_FuncExpr)
-     {
-         return true;
-     }
- 
-     /* Recurse to check arguments */
-     if (IsA(node, Query))
-     {
-         /* Recurse into subselects */
-         return query_tree_walker((Query *) node,
-                                  tdengine_contain_functions_walker,
-                                  context, 0);
-     }
-     return expression_tree_walker(node, tdengine_contain_functions_walker,
-                                   context);
- }
- 
- /*
-  * Returns true if given tlist is safe to evaluate on the foreign server.
-  */
- bool
- tdengine_is_foreign_function_tlist(PlannerInfo *root,
-                                    RelOptInfo *baserel,
-                                    List *tlist)
- {
-     InfluxDBFdwRelationInfo *fpinfo = (InfluxDBFdwRelationInfo *) (baserel->fdw_private);
-     ListCell   *lc;
-     bool		is_contain_function;
-     bool		have_slvar_fields = false;
-     foreign_glob_cxt glob_cxt;
-     foreign_loc_cxt loc_cxt;
- 
-     if (!(baserel->reloptkind == RELOPT_BASEREL ||
-           baserel->reloptkind == RELOPT_OTHER_MEMBER_REL))
-         return false;
- 
-     /*
-      * Check that the expression consists of any immutable function.
-      */
-     is_contain_function = false;
-     foreach(lc, tlist)
-     {
-         TargetEntry *tle = lfirst_node(TargetEntry, lc);
- 
-         if (tdengine_contain_functions_walker((Node *) tle->expr, NULL))
-         {
-             is_contain_function = true;
-             break;
-         }
-     }
- 
-     if (!is_contain_function)
-         return false;
- 
-     /*
-      * have_otherfunc_influx_time_tlist variable is set
-      * by tdengine_foreign_expr_walker().
-      */
-     loc_cxt.have_otherfunc_influx_time_tlist = false;
- 
-     /*
-      * Check that the expression consists of nodes that are safe to execute
-      * remotely.
-      */
-     foreach(lc, tlist)
-     {
-         TargetEntry *tle = lfirst_node(TargetEntry, lc);
- 
-         /*
-          * Check that the expression consists of nodes that are safe to
-          * execute remotely.
-          */
-         glob_cxt.root = root;
-         glob_cxt.foreignrel = baserel;
-         glob_cxt.relid = fpinfo->table->relid;
-         glob_cxt.mixing_aggref_status = INFLUXDB_TARGETS_MIXING_AGGREF_SAFE;
-         glob_cxt.for_tlist = true;
-         glob_cxt.is_inner_func = false;
- 
-         /*
-          * For an upper relation, use relids from its underneath scan
-          * relation, because the upperrel's own relids currently aren't set to
-          * anything meaningful by the core code.  For other relation, use
-          * their own relids.
-          */
-         if (baserel->reloptkind == RELOPT_UPPER_REL)
-             glob_cxt.relids = fpinfo->outerrel->relids;
-         else
-             glob_cxt.relids = baserel->relids;
-         loc_cxt.collation = InvalidOid;
-         loc_cxt.state = FDW_COLLATE_NONE;
-         loc_cxt.can_skip_cast = false;
-         loc_cxt.can_pushdown_stable = false;
-         loc_cxt.can_pushdown_volatile = false;
-         loc_cxt.influx_fill_enable = false;
-         loc_cxt.has_time_key = false;
-         loc_cxt.has_sub_or_add_operator = false;
-         if (!tdengine_foreign_expr_walker((Node *) tle->expr, &glob_cxt, &loc_cxt))
-             return false;
- 
-         /*
-          * Do not push down when selecting multiple targets which contains
-          * star or regex functions
-          */
-         if (list_length(tlist) > 1 && loc_cxt.can_pushdown_stable)
-         {
-             elog(WARNING, "Selecting multiple functions with regular expression or star. The query are not pushed down.");
-             return false;
-         }
- 
-         /*
-          * If the expression has a valid collation that does not arise from a
-          * foreign var, the expression can not be sent over.
-          */
-         if (loc_cxt.state == FDW_COLLATE_UNSAFE)
-             return false;
- 
-         /*
-          * An expression which includes any mutable functions can't be sent
-          * over because its result is not stable.  For example, sending now()
-          * remote side could cause confusion from clock offsets.  Future
-          * versions might be able to make this choice with more granularity.
-          * (We check this last because it requires a lot of expensive catalog
-          * lookups.)
-          */
-         if (!IsA(tle->expr, FieldSelect))
-         {
-             if (!loc_cxt.can_pushdown_volatile)
-             {
-                 if (loc_cxt.can_pushdown_stable)
-                 {
-                     if (contain_volatile_functions((Node *) tle->expr))
-                         return false;
-                 }
-                 else
-                 {
-                     if (contain_mutable_functions((Node *) tle->expr))
-                         return false;
-                 }
-             }
-         }
- 
-         if (IsA(tle->expr, Var))
-         {
-             Var *var = (Var *) tle->expr;
-             bool is_field_key = false;
- 
-             if (tdengine_is_slvar(var->vartype, var->varattno, &fpinfo->slinfo, NULL, &is_field_key) && is_field_key)
-             {
-                 have_slvar_fields = true;
-             }
-         }
-     }
- 
-     /*
-      * Does not pushdown functions (excepting influx_time()) if there's
-      * a schemaless type variable. If function is pushdown, we cannot
-      * construct correctly the json string value for fields value since
-      * the result of function is returned also, but the FDW cannot distinguish
-      * whether the result column and which is the result for functions.
-      */
-     if (have_slvar_fields)
-     {
-         if (loc_cxt.have_otherfunc_influx_time_tlist)
-         {
-             /*
-              * If there is any other functions than influx_time(), we can not pushdown them.
-              */
-             return false;
-         }
- 
-         /*
-          * All actual columns is required to be fetched from remote to construct fields value.
-          */
-         fpinfo->all_fieldtag = true;
-     }
- 
-     /* OK for the target list with functions to evaluate on the remote server */
-     return true;
- }
- 
- /* Check type of node whether it is string or not */
- static bool
- tdengine_is_string_type(Node *node, schemaless_info *pslinfo)
- {
-     Oid			oidtype = 0;
- 
-     if (node == NULL)
-         return false;
- 
-     if (IsA(node, Var))
-     {
-         Var		   *var = (Var *) node;
- 
-         oidtype = var->vartype;
- 
-     }
-     else if (IsA(node, Const))
-     {
-         Const	   *c = (Const *) node;
- 
-         oidtype = c->consttype;
-     }
-     else if (IsA(node, OpExpr))
-     {
-         OpExpr *oe = (OpExpr *) node;
- 
-         if (tdengine_is_slvar_fetch(node, pslinfo))
-         {
-             oidtype = oe->opresulttype;
-         }
-         else
-             return expression_tree_walker(node, tdengine_is_string_type, pslinfo);
-     }
-     else if (IsA(node, CoerceViaIO))
-     {
-         CoerceViaIO *cio = (CoerceViaIO *) node;
-         Node *arg = (Node *)cio->arg;
- 
-         if (tdengine_is_slvar_fetch(arg, pslinfo))
-         {
-             oidtype = cio->resulttype;
-         }
-         else
-             return expression_tree_walker(node, tdengine_is_string_type, pslinfo);
-     }
-     else
-     {
-         return expression_tree_walker(node, tdengine_is_string_type, pslinfo);
-     }
- 
-     switch (oidtype)
-     {
-         case CHAROID:
-         case VARCHAROID:
-         case TEXTOID:
-         case BPCHAROID:
-         case NAMEOID:
-             return true;
-         default:
-             return false;
-     }
- }
- 
- int
- tdengine_get_number_field_key_match(Oid relid, char *regex)
- {
-     int			i = 0;
-     int			nfields = 0;
-     char	   *colname = NULL;
-     regex_t		regex_cmp;
- 
-     /* Compile a regular expression */
-     if (regex != NULL)
-         if (regcomp(&regex_cmp, regex, 0) != 0)
-             elog(ERROR, "Cannot initial regex");
- 
-     do
-     {
-         colname = get_attname(relid, ++i
- #if (PG_VERSION_NUM >= 110000)
-                               ,
-                               true
- #endif
-             );
- 
-         if (colname != NULL &&
-             !INFLUXDB_IS_TIME_COLUMN(colname) &&
-             !tdengine_is_tag_key(colname, relid))
-         {
-             if (regex != NULL)
-             {
-                 /* Check whether column name match regex or not */
-                 if (regexec(&regex_cmp, colname, 0, NULL, 0) == 0)
-                     nfields++;
-             }
-             else
-             {
-                 nfields++;
-             }
-         }
-     } while (colname != NULL);
- 
-     if (regex != NULL)
-         regfree(&regex_cmp);
- 
-     return nfields;
- }
- 
- int
- tdengine_get_number_tag_key(Oid relid, schemaless_info *pslinfo)
- {
-     int			i = 0;
-     int			ntags = 0;
-     char	   *colname = NULL;
- 
-     if (pslinfo->schemaless)
-     {
-         tdengine_opt *options;
- 
-         /* Get FDW options */
-         options = tdengine_get_options(relid, GetUserId());
- 
-         return list_length(options->tags_list);
-     }
- 
-     do
-     {
-         colname = get_attname(relid, ++i
- #if (PG_VERSION_NUM >= 110000)
-                               ,
-                               true
- #endif
-             );
- 
-         if (colname != NULL &&
-             !INFLUXDB_IS_TIME_COLUMN(colname) &&
-             tdengine_is_tag_key(colname, relid))
-         {
-             ntags++;
-         }
-     } while (colname != NULL);
- 
-     return ntags;
- }
- 
- /*
-  * Return true if function name existed in list of function
-  */
- static bool
- exist_in_function_list(char *funcname, const char **funclist)
- {
-     int			i;
- 
-     for (i = 0; funclist[i]; i++)
-     {
-         if (strcmp(funcname, funclist[i]) == 0)
-             return true;
-     }
-     return false;
- }
- 
- /*
-  * tdengine_is_select_all:
-  *  True if all variables are selected or selected any schemaless column (e.g. column fields jsonb OPTIONS (fields 'true'))
-  */
- bool
- tdengine_is_select_all(RangeTblEntry *rte, List *tlist, schemaless_info *pslinfo)
- {
-     int         i;
-     int         natts = 0;
-     int         natts_valid = 0;
-     Relation	rel = table_open(rte->relid, NoLock);
-     TupleDesc	tupdesc = RelationGetDescr(rel);
-     Oid         rel_type_id;
-     bool        has_rel_type_id = false;
-     bool        has_slcol = false;
-     bool        has_wholerow = false;
- 
-     rel_type_id = get_rel_type_id(rte->relid);
- 
-     for (i = 1; i <= tupdesc->natts; i++)
-     {
-         Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
-         ListCell          *lc;
- 
-         /* Ignore dropped attributes. */
-         if (attr->attisdropped)
-             continue;
- 
-         natts_valid++;
- 
-         foreach(lc, tlist)
-         {
-             Node *node = (Node *)lfirst(lc);
- 
-             if (IsA(node, TargetEntry))
-                 node = (Node *)((TargetEntry *) node)->expr;
- 
-             if (IsA(node, Var))
-             {
-                 Var *var = (Var *) node;
- 
-                 if (var->vartype == rel_type_id)
-                 {
-                     has_rel_type_id = true;
-                     break;
-                 }
- 
-                 /* If there's a whole-row reference, we'll need all the columns. */
-                 if (var->varattno == 0)
-                 {
-                     has_wholerow = true;
-                     break;
-                 }
- 
-                 /* If there's a schemaless type variable, we'll need all the columns. */
-                 if (tdengine_is_slvar(var->vartype, var->varattno, pslinfo, NULL, NULL))
-                 {
-                     has_slcol = true;
-                     break;
-                 }
- 
-                 if (var->varattno == attr->attnum)
-                 {
-                     natts++;
-                     break;
-                 }
-             }
-             if (has_rel_type_id || has_slcol || has_wholerow)
-                 break;
-         }
-     }
- 
-     table_close(rel, NoLock);
- 
-     return ((natts == natts_valid) || has_rel_type_id || has_slcol || has_wholerow);
- }
- 
- /*
-  * tdengine_is_no_field_key: True if there is no field key
-  */
- static bool
- tdengine_is_no_field_key(Oid reloid, List *slcols)
- {
-     int i;
-     bool no_field_key = true;
- 
-     /* Check whether there are no field key in tlist */
-     for (i = 1; i <= list_length(slcols); i++)
-     {
-         StringInfo *rcol = (StringInfo *)list_nth(slcols, i-1);
-         char *colname = strVal(rcol);
- 
-         if (!INFLUXDB_IS_TIME_COLUMN(colname))
-         {
-             if (!tdengine_is_tag_key(colname, reloid))
-             {
-                 no_field_key = false;
-                 break;
-             }
-         }
-     }
- 
-     return no_field_key;
- }
- 
- /*
-  * Emit a remote target list that retrieves the columns specified in attrs_used.
-  * This is used for both SELECT and RETURNING targetlists.
-  */
- static void
- tdengine_deparse_target_list_schemaless(StringInfo buf,
-                                         Relation rel,
-                                         Oid reloid,
-                                         Bitmapset *attrs_used,
-                                         List **retrieved_attrs,
-                                         bool all_fieldtag,
-                                         List *slcols)
- {
-     TupleDesc	tupdesc = RelationGetDescr(rel);
-     bool		first;
-     int			i;
-     bool		no_field_key;
- 
-     no_field_key = tdengine_is_no_field_key(reloid, slcols);
- 
-     *retrieved_attrs = NIL;
-     for (i = 1; i <= tupdesc->natts; i++)
-     {
-         Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
- 
-         /* Ignore dropped attributes. */
-         if (attr->attisdropped)
-             continue;
- 
-         if (all_fieldtag || no_field_key ||
-             bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
-                           attrs_used))
-             *retrieved_attrs = lappend_int(*retrieved_attrs, i);
-     }
- 
-     if (all_fieldtag || no_field_key)
-     {
-         appendStringInfoString(buf, "*");
-         return;
-     }
- 
-     first = true;
- 
-     for (i = 1; i <= list_length(slcols); i++)
-     {
-         StringInfo *rcol = (StringInfo *)list_nth(slcols, i-1);
-         char *colname = strVal(rcol);
- 
-         /* Skip if column is time */
-         if (!INFLUXDB_IS_TIME_COLUMN(colname))
-         {
-             if (!first)
-                 appendStringInfoString(buf, ", ");
-             first = false;
-             appendStringInfoString(buf, tdengine_quote_identifier(colname, QUOTE));
-         }
-     }
- }
- 
- /*
-  * Deparse CoerceViaIO
-  */
- static void
- tdengine_deparse_coerce_via_io(CoerceViaIO * cio, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     InfluxDBFdwRelationInfo *fpinfo =
-         (InfluxDBFdwRelationInfo *)(context->foreignrel->fdw_private);
-     OpExpr *oe = (OpExpr *)cio->arg;
- 
-     Assert(fpinfo->slinfo.schemaless);
- 
-     /* check schemaless var */
-     if (tdengine_is_slvar_fetch((Node *)oe, &(fpinfo->slinfo)))
-     {
-         tdengine_deparse_slvar((Node *)cio, linitial_node(Var, oe->args), lsecond_node(Const, oe->args), context);
-     }
-     else if (tdengine_is_param_fetch((Node *)oe, &(fpinfo->slinfo)))
-     {
-         tdengine_deparse_param((Param *)cio, context);
-     }
- 
-     if (cio->resulttype == BOOLOID && context->has_bool_cmp)
-     {
-         appendStringInfoString(buf, " = true");
-     }
- }
- 
- /*
-  * Deparse expression of tdengine_tags/tdengine_fields var -> const
-  */
- static void
- tdengine_deparse_slvar(Node *node, Var *var, Const *cnst, deparse_expr_cxt *context)
- {
-     StringInfo	buf = context->buf;
-     Relids		relids = context->scanrel->relids;
- 
-     if (bms_is_member(var->varno, relids) && var->varlevelsup == 0)
-     {
-         appendStringInfo(buf, "%s", tdengine_quote_identifier(TextDatumGetCString(cnst->constvalue), QUOTE));
-     }
-     else
-     {
-         /* Treat like a Param */
-         if (context->params_list)
-         {
-             int			pindex = 0;
-             ListCell   *lc;
- 
-             /* find its index in params_list */
-             foreach(lc, *context->params_list)
-             {
-                 pindex++;
-                 if (equal(node, (Node *) lfirst(lc)))
-                     break;
-             }
-             if (lc == NULL)
-             {
-                 /* not in list, so add it */
-                 pindex++;
-                 *context->params_list = lappend(*context->params_list, node);
-             }
-             tdengine_print_remote_param(pindex, var->vartype, var->vartypmod, context);
-         }
-         else
-         {
-             tdengine_print_remote_placeholder(var->vartype, var->vartypmod, context);
-         }
-     }
- }
- 
- /*
-  * tdengine_escape_json_string
-  *		Escapes a string for safe inclusion in JSON.
-  */
- char *
- tdengine_escape_json_string(char *string)
- {
-     StringInfo	buffer;
-     const char *ptr;
-     int			i;
-     int			segment_start_idx;
-     int			len;
-     bool		needed_escaping = false;
- 
-     if (string == NULL)
-         return NULL;
- 
-     for (ptr = string; *ptr; ++ptr)
-     {
-         if (*ptr == '"' || *ptr == '\r' || *ptr == '\n' || *ptr == '\t' ||
-             *ptr == '\\')
-         {
-             needed_escaping = true;
-             break;
-         }
-     }
- 
-     if (!needed_escaping)
-         return pstrdup(string);
- 
-     buffer = makeStringInfo();
-     len = strlen(string);
-     segment_start_idx = 0;
-     for (i = 0; i < len; ++i)
-     {
-         if (string[i] == '"' || string[i] == '\r' || string[i] == '\n' ||
-             string[i] == '\t' || string[i] == '\\')
-         {
-             if (segment_start_idx < i)
-                 appendBinaryStringInfo(buffer, string + segment_start_idx,
-                                        i - segment_start_idx);
- 
-             appendStringInfoChar(buffer, '\\');
-             if (string[i] == '"')
-                 appendStringInfoChar(buffer, '"');
-             else if (string[i] == '\r')
-                 appendStringInfoChar(buffer, 'r');
-             else if (string[i] == '\n')
-                 appendStringInfoChar(buffer, 'n');
-             else if (string[i] == '\t')
-                 appendStringInfoChar(buffer, 't');
-             else if (string[i] == '\\')
-                 appendStringInfoChar(buffer, '\\');
- 
-             segment_start_idx = i + 1;
-         }
-     }
-     if (segment_start_idx < len)
-         appendBinaryStringInfo(buffer, string + segment_start_idx,
-                                len - segment_start_idx);
-     return buffer->data;
- }
- 
- /*
-  * tdengine_escape_record_string
-  *		Escapes a string for safe inclusion in record format
-  *		that followed PostgreSQL composite type.
-  */
- char *
- tdengine_escape_record_string(char *string)
- {
-     StringInfo	buffer;
-     const char *ptr;
-     int			i;
-     int			segment_start_idx;
-     int			len;
-     bool		needed_escaping = false;
- 
-     if (string == NULL)
-         return NULL;
- 
-     /*
-      * If fields value containing parentheses, commas, double quotes, or backslashes
-      * must be double quoted.
-      */
-     for (ptr = string; *ptr; ++ptr)
-     {
-         if (*ptr == '"' || *ptr == '\\' || *ptr == ',' || *ptr == '(' || *ptr == ')')
-         {
-             needed_escaping = true;
-             break;
-         }
-     }
- 
-     if (!needed_escaping)
-         return pstrdup(string);
- 
-     buffer = makeStringInfo();
-     len = strlen(string);
-     segment_start_idx = 0;
- 
-     appendStringInfoChar(buffer, '"');
- 
-     /*
-      * To put a double quote or backslash in a quoted composite field value,
-      * precede it with a backslash.
-      */
-     for (i = 0; i < len; ++i)
-     {
-         if (string[i] == '"' || string[i] == '\\')
-         {
-             if (segment_start_idx < i)
-                 appendBinaryStringInfo(buffer, string + segment_start_idx,
-                                        i - segment_start_idx);
- 
-             appendStringInfoChar(buffer, '\\');
-             if (string[i] == '"')
-                 appendStringInfoChar(buffer, '"');
-             else if (string[i] == '\\')
-                 appendStringInfoChar(buffer, '\\');
- 
-             segment_start_idx = i + 1;
-         }
-     }
-     if (segment_start_idx < len)
-         appendBinaryStringInfo(buffer, string + segment_start_idx,
-                                len - segment_start_idx);
- 
-     appendStringInfoChar(buffer, '"');
- 
-     return buffer->data;
- }
- 
- /*
-  * Construct DROP MEASUREMENT <measurement_name> query.
-  *	This query deletes all data and series from the specified <measurement_name>
-  *	and deletes the measurement from the index.
-  */
- void
- tdengine_deparse_drop_measurement_stmt(StringInfo buf, Relation rel)
- {
-     appendStringInfo(buf, "DROP MEASUREMENT ");
-     tdengine_deparse_relation(buf, rel);
- }
- 
+/*
+ * foreign_loc_cxt: 表达式树遍历的局部上下文结构
+ *
+ * 成员说明:
+ *   @collation: 当前排序规则OID(如果有)
+ *   @state: 当前排序规则选择状态
+ *   @can_skip_cast: 外部函数是否可以跳过float8/numeric转换
+ *   @can_pushdown_stable: 查询是否包含带星号或正则的stable函数
+ *   @can_pushdown_volatile: 查询是否包含volatile函数
+ *   @influx_fill_enable: 是否在influx_time()内解析子表达式 TODO:
+ *   @have_otherfunc_influx_time_tlist: 目标列表中是否有除influx_time()外的其他函数 TODO:
+ *   @has_time_key: 是否与时间键列比较
+ *   @has_sub_or_add_operator: 表达式是否包含'+'或'-'运算符
+ *   @is_comparison: 是否包含比较操作
+ *
+ * 使用场景:
+ *   用于tdengine_foreign_expr_walker遍历表达式树时的局部状态保持
+ */
+typedef struct foreign_loc_cxt
+{
+	Oid collation;
+	FDWCollateState state;
+	bool can_skip_cast;
+	bool can_pushdown_stable;
+	bool can_pushdown_volatile;
+	bool influx_fill_enable;			   // TODO:
+	bool have_otherfunc_influx_time_tlist; // TODO:
+	bool has_time_key;
+	bool has_sub_or_add_operator;
+	bool is_comparison;
+} foreign_loc_cxt;
+
+/*
+ * Returns true if given expr is safe to evaluate on the foreign server.
+ */
+bool tdengine_is_foreign_expr(PlannerInfo *root,
+							  RelOptInfo *baserel,
+							  Expr *expr,
+							  bool for_tlist)
+{
+	foreign_glob_cxt glob_cxt;
+	foreign_loc_cxt loc_cxt;
+	TDengineFdwRelationInfo *fpinfo = (TDengineFdwRelationInfo *)(baserel->fdw_private);
+
+	/*
+	 * Check that the expression consists of nodes that are safe to execute
+	 * remotely.
+	 */
+	glob_cxt.root = root;
+	glob_cxt.foreignrel = baserel;
+	glob_cxt.relid = fpinfo->table->relid;
+	glob_cxt.mixing_aggref_status = TDENGINE_TARGETS_MIXING_AGGREF_SAFE;
+	glob_cxt.for_tlist = for_tlist;
+	glob_cxt.is_inner_func = false;
+
+	/*
+	 * For an upper relation, use relids from its underneath scan relation,
+	 * because the upperrel's own relids currently aren't set to anything
+	 * meaningful by the core code.  For other relation, use their own relids.
+	 */
+	if (baserel->reloptkind == RELOPT_UPPER_REL)
+		glob_cxt.relids = fpinfo->outerrel->relids;
+	else
+		glob_cxt.relids = baserel->relids;
+	loc_cxt.collation = InvalidOid;
+	loc_cxt.state = FDW_COLLATE_NONE;
+	loc_cxt.can_skip_cast = false;
+	loc_cxt.influx_fill_enable = false;
+	loc_cxt.has_time_key = false;
+	loc_cxt.has_sub_or_add_operator = false;
+	loc_cxt.is_comparison = false;
+	if (!tdengine_foreign_expr_walker((Node *)expr, &glob_cxt, &loc_cxt))
+		return false;
+
+	/*
+	 * If the expression has a valid collation that does not arise from a
+	 * foreign var, the expression can not be sent over.
+	 */
+	if (loc_cxt.state == FDW_COLLATE_UNSAFE)
+		return false;
+
+	/* OK to evaluate on the remote server */
+	return true;
+}
+
+/*
+ * is_valid_type: 检查给定的OID是否为TDengine支持的有效数据类型
+ *
+ * 参数:
+ *   @type: 要检查的数据类型OID
+ *
+ * 返回值:
+ *   true - 是TDengine支持的数据类型
+ *   false - 不是TDengine支持的数据类型
+ *
+ * 功能说明:
+ *   1. 检查输入的类型OID是否在TDengine支持的数据类型列表中
+ *      虽然所有类型OID都定义在PostgreSQL头文件中，
+ *      但函数只选择了TDengine支持的那些类型子集进行检查
+ *   2. 支持的类型包括:
+ *      - 整数类型(INT2/INT4/INT8/OID)
+ *      - 浮点类型(FLOAT4/FLOAT8/NUMERIC)
+ *      - 字符串类型(VARCHAR/TEXT)
+ *      - 时间类型(TIME/TIMESTAMP/TIMESTAMPTZ)
+ *
+ * 使用场景:
+ *   在表达式下推检查时，用于验证参数或变量的数据类型是否可以被TDengine处理
+ */
+static bool
+is_valid_type(Oid type)
+{
+	switch (type)
+	{
+	case INT2OID:
+	case INT4OID:
+	case INT8OID:
+	case OIDOID:
+	case FLOAT4OID:
+	case FLOAT8OID:
+	case NUMERICOID:
+	case VARCHAROID:
+	case TEXTOID:
+	case TIMEOID:
+	case TIMESTAMPOID:
+	case TIMESTAMPTZOID:
+		return true;
+	}
+	return false;
+}
+
+/*
+ * tdengine_foreign_expr_walker: 递归检查表达式节点是否可下推到TDengine执行
+ *
+ * 参数:
+ *   @node: 要检查的表达式节点
+ *   @glob_cxt: 全局上下文信息(包含规划器状态、外部表信息等)
+ *   @outer_cxt: 外层表达式上下文信息(包含排序规则状态等)
+ *
+ * 返回值:
+ *   true - 表达式可以安全下推到TDengine执行
+ *   false - 表达式不能下推到TDengine执行
+ *
+ * 功能说明:
+ *   1. 递归遍历表达式树，检查各种节点类型是否支持远程执行
+ *   2. 维护表达式下推状态信息(排序规则、类型安全等)
+ *   3. 处理不同类型节点的特殊限制条件
+ *   4. 更新全局和局部上下文信息
+ *
+ * 处理流程:
+ *   1. 初始化内层上下文信息
+ *   2. 根据节点类型进行不同处理
+ *   3. 递归检查子节点
+ *   4. 合并子节点的状态信息
+ *   5. 返回最终检查结果
+ */
+static bool
+tdengine_foreign_expr_walker(Node *node,
+							 foreign_glob_cxt *glob_cxt,
+							 foreign_loc_cxt *outer_cxt)
+{
+	bool check_type = true;				/* 是否需要检查类型安全性 */
+	foreign_loc_cxt inner_cxt;			/* 内层表达式上下文 */
+	Oid collation;						/* 当前节点的排序规则OID */
+	FDWCollateState state;				/* 排序规则状态 */
+	HeapTuple tuple;					/* 系统缓存元组 */
+	Form_pg_operator form;				/* 操作符信息结构体 */
+	char *cur_opname;					/* 当前操作符名称 */
+	static bool is_time_column = false; /* 标记是否时间列(静态变量保持状态) */
+
+	/* 获取FDW关系信息 */
+	TDengineFdwRelationInfo *fpinfo =
+		(TDengineFdwRelationInfo *)(glob_cxt->foreignrel->fdw_private);
+
+	/* 空节点直接返回true */
+	if (node == NULL)
+		return true;
+
+	/* 初始化内层上下文 */
+	inner_cxt.collation = InvalidOid;
+	inner_cxt.state = FDW_COLLATE_NONE;
+	inner_cxt.can_skip_cast = false;
+	inner_cxt.can_pushdown_stable = false;
+	inner_cxt.can_pushdown_volatile = false;
+	inner_cxt.influx_fill_enable = false;
+	inner_cxt.has_time_key = false;
+	inner_cxt.has_sub_or_add_operator = false;
+	inner_cxt.is_comparison = false;
+
+	/* 根据节点类型进行不同处理 */
+	switch (nodeTag(node))
+	{
+	case T_Var:
+		/* 处理变量节点 */
+		{
+			Var *var = (Var *)node;
+
+			/*
+			 * 如果变量属于外部表，则认为其排序规则是安全的；
+			 * 如果属于其他表，则按参数处理方式处理其排序规则
+			 */
+			if (bms_is_member(var->varno, glob_cxt->relids) &&
+				var->varlevelsup == 0)
+			{
+				/* 变量属于外部表 */
+
+				/* 检查变量属性号是否有效 */
+				if (var->varattno < 0)
+					return false;
+
+				/* 检查是否为时间类型列 */
+				if (TDENGINE_IS_TIME_TYPE(var->vartype))
+				{
+					is_time_column = true;
+
+					/*
+					 * 不支持下推时间列与时间键的比较运算(包含加减间隔的情况)
+					 * 例如: time_key = time_column +/- interval
+					 */
+					if (outer_cxt->is_comparison &&
+						outer_cxt->has_sub_or_add_operator &&
+						outer_cxt->has_time_key)
+						return false;
+				}
+
+				/* 标记当前目标是字段/标签列 */
+				glob_cxt->mixing_aggref_status |= TDENGINE_TARGETS_MARK_COLUMN;
+
+				/* 检查排序规则 */
+				collation = var->varcollid;
+				state = OidIsValid(collation) ? FDW_COLLATE_SAFE : FDW_COLLATE_NONE;
+			}
+			else
+			{
+				/* 变量属于其他表的情况 */
+				collation = var->varcollid;
+				if (collation == InvalidOid ||
+					collation == DEFAULT_COLLATION_OID)
+				{
+					/*
+					 * 无排序规则或与外部变量排序规则兼容时，
+					 * 设置为NONE状态
+					 */
+					state = FDW_COLLATE_NONE;
+				}
+				else
+				{
+					/*
+					 * 不立即返回失败，因为变量可能出现在
+					 * 不关心排序规则的上下文中
+					 */
+					state = FDW_COLLATE_UNSAFE;
+				}
+			}
+		}
+		break;
+
+	/* 处理常量节点(Const) */
+	case T_Const:
+	{
+		char *type_name;
+		Const *c = (Const *)node;
+
+		/* 处理INTERVAL类型常量 */
+		if (c->consttype == INTERVALOID)
+		{
+			Interval *interval = DatumGetIntervalP(c->constvalue);
+#if (PG_VERSION_NUM >= 150000)
+			struct pg_itm tm;
+			interval2itm(*interval, &tm);
+#else
+			struct pg_tm tm;
+			fsec_t fsec;
+
+			interval2tm(*interval, &tm, &fsec);
+#endif
+
+			/*
+			 *   TDengine不支持包含月份或年份的时间间隔计算，
+			 *   因此需要过滤掉这类INTERVAL常量
+			 */
+			if (tm.tm_mon != 0 || tm.tm_year != 0)
+			{
+				return false;
+			}
+		}
+
+		/*
+		 * 处理常量类型名称检查
+		 * 功能: 检查常量类型是否为特殊类型"influx_fill_enum"
+		 *      如果是则跳过内置类型检查
+		 */
+		type_name = tdengine_get_data_type_name(c->consttype);
+		if (strcmp(type_name, "influx_fill_enum") == 0)
+			check_type = false;
+
+		/*
+		 * 检查常量排序规则
+		 * 规则:
+		 *   1. 如果常量使用非默认排序规则，表示可能是非内置类型或包含CollateExpr
+		 *   2. 这类表达式不能下推到远程执行
+		 * 返回值:
+		 *   false - 排序规则不安全，不能下推
+		 */
+		if (c->constcollid != InvalidOid &&
+			c->constcollid != DEFAULT_COLLATION_OID)
+			return false;
+
+		/* 默认情况下认为常量不设置排序规则 */
+		collation = InvalidOid;
+		state = FDW_COLLATE_NONE;
+	}
+	break;
+
+	/*
+	 * 处理参数节点(T_Param)
+	 * 功能: 检查参数类型是否有效且符合下推条件
+	 */
+	case T_Param:
+	{
+		Param *p = (Param *)node;
+
+		/* 检查参数类型是否有效 */
+		if (!is_valid_type(p->paramtype))
+			return false;
+
+		/* 处理时间类型参数的特殊限制 */
+		if (TDENGINE_IS_TIME_TYPE(p->paramtype))
+		{
+			/*
+			 * 不支持下推时间参数与时间键的比较运算(包含加减间隔的情况)
+			 * 示例: time_key = Param +/- interval
+			 */
+			if (outer_cxt->is_comparison &&
+				outer_cxt->has_sub_or_add_operator &&
+				outer_cxt->has_time_key)
+				return false;
+		}
+
+		/*
+		 * 参数排序规则处理规则:
+		 * 1. 无排序规则或默认排序规则 - 标记为NONE状态
+		 * 2. 其他排序规则 - 标记为UNSAFE状态
+		 */
+		collation = p->paramcollid;
+		if (collation == InvalidOid ||
+			collation == DEFAULT_COLLATION_OID)
+			state = FDW_COLLATE_NONE;
+		else
+			state = FDW_COLLATE_UNSAFE;
+	}
+	break;
+		/*
+		 *   1. 仅支持基础关系(RELOPT_BASEREL)或其他成员关系(RELOPT_OTHER_MEMBER_REL)
+		 *   2. 用于支持星号(*)和正则表达式函数的字段访问
+		 */
+	case T_FieldSelect:
+	{
+		if (!(glob_cxt->foreignrel->reloptkind == RELOPT_BASEREL ||
+			  glob_cxt->foreignrel->reloptkind == RELOPT_OTHER_MEMBER_REL))
+			return false;
+
+		collation = InvalidOid;
+		state = FDW_COLLATE_NONE;
+		check_type = false;
+	}
+	break;
+
+	/*
+	 * 处理函数表达式节点(T_FuncExpr)
+	 * 功能: 检查函数表达式是否可下推到远程执行
+	 */
+	case T_FuncExpr:
+	{
+		FuncExpr *fe = (FuncExpr *)node;
+		char *opername = NULL;
+		bool is_cast_func = false;
+		bool is_star_func = false;
+		bool can_pushdown_func = false;
+		bool is_regex = false;
+
+		/* 从系统缓存获取函数名称 */
+		tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(fe->funcid));
+		if (!HeapTupleIsValid(tuple))
+		{
+			elog(ERROR, "cache lookup failed for function %u", fe->funcid);
+		}
+		opername = pstrdup(((Form_pg_proc)GETSTRUCT(tuple))->proname.data);
+		ReleaseSysCache(tuple);
+
+		/* 处理时间类型函数的特殊限制 */
+		if (TDENGINE_IS_TIME_TYPE(fe->funcresulttype))
+		{
+			if (outer_cxt->is_comparison)
+			{
+				/* 仅支持now()函数的时间比较 */
+				if (strcmp(opername, "now") != 0)
+				{
+					return false;
+				}
+				/* 仅支持now()与时间键的比较 */
+				else if (!outer_cxt->has_time_key)
+				{
+					return false;
+				}
+			}
+		}
+
+		/* 检查是否为类型转换函数(float8/numeric) */
+		if (strcmp(opername, "float8") == 0 || strcmp(opername, "numeric") == 0)
+		{
+			is_cast_func = true;
+		}
+
+		/* 下推到 TDengine */
+		if (tdengine_is_star_func(fe->funcid, opername))
+		{
+			is_star_func = true;
+			outer_cxt->can_pushdown_stable = true;
+		}
+
+		if (tdengine_is_unique_func(fe->funcid, opername) ||
+			tdengine_is_supported_builtin_func(fe->funcid, opername))
+		{
+			can_pushdown_func = true;
+			inner_cxt.can_skip_cast = true;
+			outer_cxt->can_pushdown_volatile = true;
+		}
+
+		if (!(is_star_func || can_pushdown_func || is_cast_func))
+			return false;
+
+		// TODO: fill()函数相关
+		/* fill() must be inside influx_time() */
+		if (strcmp(opername, "influx_fill_numeric") == 0 ||
+			strcmp(opername, "influx_fill_option") == 0)
+		{
+			if (outer_cxt->influx_fill_enable == false)
+				elog(ERROR, "tdengine_fdw: syntax error influx_fill_numeric() or influx_fill_option() must be embedded inside influx_time() function\n");
+		}
+
+		/*
+		 * 类型转换函数处理逻辑:
+		 *   1. 如果是类型转换函数(float8/numeric)且外层不允许跳过转换检查，则拒绝下推
+		 *   2. 对于非类型转换函数:
+		 *      - 如果不在目标列表(for_tlist=false)且是嵌套函数(is_inner_func=true)，则拒绝下推
+		 *      - 否则标记当前处于嵌套函数环境中
+		 */
+		if (is_cast_func)
+		{
+			/* 类型转换函数必须在外层允许跳过转换检查时才可下推 */
+			if (outer_cxt->can_skip_cast == false)
+				return false;
+		}
+		else
+		{
+			/*
+			 * 非目标列表中的嵌套函数不能下推执行
+			 * 防止在非SELECT列表位置执行嵌套函数
+			 */
+			if (!glob_cxt->for_tlist && glob_cxt->is_inner_func)
+				return false;
+
+			/* 标记当前处理的是嵌套函数 */
+			glob_cxt->is_inner_func = true;
+		}
+
+		/*
+		 * Allow influx_fill_numeric/influx_fill_option() inside
+		 * influx_time() function
+		 */
+		if (strcmp(opername, "influx_time") == 0)
+		{
+			inner_cxt.influx_fill_enable = true;
+		}
+		else
+		{
+			/* There is another function than influx_time in tlist */
+			outer_cxt->have_otherfunc_influx_time_tlist = true;
+		}
+
+		/*
+		 * Recurse to input subexpressions.
+		 */
+		if (!tdengine_foreign_expr_walker((Node *)fe->args,
+										  glob_cxt, &inner_cxt))
+			return false;
+
+		/*
+		 * Force to restore the state after deparse subexpression if
+		 * it has been change above
+		 */
+		inner_cxt.influx_fill_enable = false;
+
+		if (!is_cast_func)
+			glob_cxt->is_inner_func = false;
+
+		if (list_length(fe->args) > 0)
+		{
+			ListCell *funclc;
+			Node *firstArg;
+
+			funclc = list_head(fe->args);
+			firstArg = (Node *)lfirst(funclc);
+
+			if (IsA(firstArg, Const))
+			{
+				Const *arg = (Const *)firstArg;
+				char *extval;
+
+				if (arg->consttype == TEXTOID)
+					is_regex = tdengine_is_regex_argument(arg, &extval);
+			}
+		}
+
+		if (is_regex)
+		{
+			collation = InvalidOid;
+			state = FDW_COLLATE_NONE;
+			check_type = false;
+			outer_cxt->can_pushdown_stable = true;
+		}
+		else
+		{
+			/*
+			 * If function's input collation is not derived from a
+			 * foreign Var, it can't be sent to remote.
+			 */
+			if (fe->inputcollid == InvalidOid)
+				/* OK, inputs are all noncollatable */;
+			else if (inner_cxt.state != FDW_COLLATE_SAFE ||
+					 fe->inputcollid != inner_cxt.collation)
+				return false;
+
+			/*
+			 * Detect whether node is introducing a collation not
+			 * derived from a foreign Var.  (If so, we just mark it
+			 * unsafe for now rather than immediately returning false,
+			 * since the parent node might not care.)
+			 */
+			collation = fe->funccollid;
+			if (collation == InvalidOid)
+				state = FDW_COLLATE_NONE;
+			else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+					 collation == inner_cxt.collation)
+				state = FDW_COLLATE_SAFE;
+			else if (collation == DEFAULT_COLLATION_OID)
+				state = FDW_COLLATE_NONE;
+			else
+				state = FDW_COLLATE_UNSAFE;
+		}
+	}
+	break;
+	case T_OpExpr:
+	{
+		OpExpr *oe = (OpExpr *)node;
+		bool is_slvar = false;
+		bool is_param = false;
+		bool has_time_key = false;
+		bool has_time_column = false;
+		bool has_time_tags_or_fields_column = false;
+
+		if (tdengine_is_slvar_fetch(node, &(fpinfo->slinfo)))
+			is_slvar = true;
+
+		if (tdengine_is_param_fetch(node, &(fpinfo->slinfo)))
+			is_param = true;
+
+		/* trans
+		 * 同理，只有内置操作符才能下推到远程执行。
+		 * (如果操作符是内置的，那么其底层函数也必然是内置的)
+		 */
+		if (!tdengine_is_builtin(oe->opno) && !is_slvar && !is_param)
+			return false;
+
+		tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(oe->opno));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for operator %u", oe->opno);
+		form = (Form_pg_operator)GETSTRUCT(tuple);
+
+		/* opname is not a SQL identifier, so we should not quote it. */
+		cur_opname = pstrdup(NameStr(form->oprname));
+		ReleaseSysCache(tuple);
+
+		if (strcmp(cur_opname, "=") == 0 ||
+			strcmp(cur_opname, ">") == 0 ||
+			strcmp(cur_opname, "<") == 0 ||
+			strcmp(cur_opname, ">=") == 0 ||
+			strcmp(cur_opname, "<=") == 0 ||
+			strcmp(cur_opname, "!=") == 0 ||
+			strcmp(cur_opname, "<>") == 0)
+		{
+			inner_cxt.is_comparison = true;
+		}
+
+		/* trans
+		 * 不支持下推时间间隔(interval)与时间间隔之间的比较运算
+		 * 例如:
+		 *	(时间-时间) vs 时间间隔常量
+		 *	(时间-时间) vs (时间-时间)
+		 */
+
+		if (inner_cxt.is_comparison &&
+			exprType((Node *)linitial(oe->args)) == INTERVALOID &&
+			exprType((Node *)lsecond(oe->args)) == INTERVALOID)
+		{
+			return false;
+		}
+
+		has_time_key = tdengine_contain_time_key_column(glob_cxt->relid, oe->args);
+
+		/* trans
+		 * 不支持下推时间表达式与非时间键列的比较运算
+		 * 例如:
+		 *	时间+/-间隔 vs 标签/字段列
+		 *	时间+/-间隔 vs 时间+/-间隔
+		 *	时间+/-间隔 vs 函数
+		 */
+
+		if (inner_cxt.is_comparison &&
+			!has_time_key &&
+			tdengine_contain_time_expr(oe->args))
+		{
+			return false;
+		}
+
+		/*
+		 * Does not pushdown comparsion using !=, <> with time key column.
+		 */
+		if (strcmp(cur_opname, "!=") == 0 ||
+			strcmp(cur_opname, "<>") == 0)
+		{
+			if (has_time_key)
+				return false;
+		}
+
+		has_time_column = tdengine_contain_time_column(oe->args, &(fpinfo->slinfo));
+
+		has_time_tags_or_fields_column = (has_time_column && !has_time_key);
+
+		/* Does not pushdown time comparison between tags/fields vs function */
+		if (inner_cxt.is_comparison &&
+			has_time_tags_or_fields_column &&
+			tdengine_contain_time_function(oe->args))
+		{
+			return false;
+		}
+
+		if (strcmp(cur_opname, ">") == 0 ||
+			strcmp(cur_opname, "<") == 0 ||
+			strcmp(cur_opname, ">=") == 0 ||
+			strcmp(cur_opname, "<=") == 0 ||
+			strcmp(cur_opname, "=") == 0)
+		{
+			List *first = list_make1(linitial(oe->args));
+			List *second = list_make1(lsecond(oe->args));
+			bool has_both_time_colum = tdengine_contain_time_column(first, &(fpinfo->slinfo)) &&
+									   tdengine_contain_time_column(second, &(fpinfo->slinfo));
+
+			/*
+			 * Does not pushdown time comparsion using <, >, <=, >=, = between time key and time column
+			 * For example:
+			 *	time key vs time key
+			 *	time key vs tags/fields column
+			 */
+			if (has_time_key && has_both_time_colum)
+			{
+				return false;
+			}
+
+			/* Handle the operators <, >, <=, >= */
+			if (strcmp(cur_opname, "=") != 0)
+			{
+				bool has_first_time_key = tdengine_contain_time_key_column(glob_cxt->relid, first);
+				bool has_second_time_key = tdengine_contain_time_key_column(glob_cxt->relid, second);
+				bool has_both_tags_or_fields_column = (has_both_time_colum && !has_first_time_key && !has_second_time_key);
+
+				/* Does not pushdown comparison between tags/fields column and time tags/field column */
+				if (has_both_tags_or_fields_column)
+					return false;
+
+				/*
+				 * Does not pushdown comparison between tags/fields column and time constant or time param
+				 * For example:
+				 *	tags/fields vs '2010-10-10 10:10:10'
+				 */
+				if (has_time_tags_or_fields_column &&
+					(tdengine_contain_time_const(oe->args) ||
+					 tdengine_contain_time_param(oe->args)))
+				{
+					return false;
+				}
+
+				/*
+				 * Cannot pushdown to TDengine if there is string comparison
+				 * with: "<, >, <=, >=" operators.
+				 */
+				if (tdengine_is_string_type((Node *)linitial(oe->args), &(fpinfo->slinfo)))
+				{
+					return false;
+				}
+			}
+		}
+
+		/*
+		 * Does not support pushdown time comparison between time key column and time column +/- interval or
+		 * param +/- interval or function +/- interval except now() +/- interval.
+		 * Set flag here and recursive check in each node T_Var, T_Param, T_FuncExpr.
+		 */
+		if (strcmp(cur_opname, "+") == 0 ||
+			strcmp(cur_opname, "-") == 0)
+		{
+			inner_cxt.has_time_key = outer_cxt->has_time_key;
+			inner_cxt.is_comparison = outer_cxt->is_comparison;
+			inner_cxt.has_sub_or_add_operator = true;
+		}
+		else
+		{
+			inner_cxt.has_time_key = has_time_key;
+		}
+
+		if (is_slvar || is_param)
+		{
+			collation = oe->inputcollid;
+			check_type = false;
+
+			state = FDW_COLLATE_SAFE;
+
+			break;
+		}
+
+		/*
+		 * Recurse to input subexpressions.
+		 */
+		if (!tdengine_foreign_expr_walker((Node *)oe->args,
+										  glob_cxt, &inner_cxt))
+			return false;
+
+		/*
+		 * Mixing aggregate and non-aggregate error occurs when SELECT
+		 * statement includes both of aggregate function and
+		 * standalone field key or tag key. It is unsafe to pushdown
+		 * if target operation expression has mixing aggregate and
+		 * non-aggregate, such as: (1+col1+sum(col2)),
+		 * (sum(col1)*col2)
+		 */
+		if ((glob_cxt->mixing_aggref_status & TDENGINE_TARGETS_MIXING_AGGREF_UNSAFE) ==
+			TDENGINE_TARGETS_MIXING_AGGREF_UNSAFE)
+		{
+			return false;
+		}
+
+		/*
+		 * If operator's input collation is not derived from a foreign
+		 * Var, it can't be sent to remote.
+		 */
+		if (oe->inputcollid == InvalidOid)
+			/* OK, inputs are all noncollatable */;
+		else if (inner_cxt.state != FDW_COLLATE_SAFE ||
+				 oe->inputcollid != inner_cxt.collation)
+			return false;
+
+		/* Result-collation handling is same as for functions */
+		collation = oe->opcollid;
+		if (collation == InvalidOid)
+			state = FDW_COLLATE_NONE;
+		else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+				 collation == inner_cxt.collation)
+			state = FDW_COLLATE_SAFE;
+		else
+			state = FDW_COLLATE_UNSAFE;
+	}
+	break;
+		/*
+		 * 处理标量数组操作表达式节点(T_ScalarArrayOpExpr)
+		 * 功能: 检查标量数组操作表达式是否可下推到远程执行
+		 *
+		 * 处理流程:
+		 *   1. 从系统缓存获取操作符信息
+		 *   2. 检查字符串类型比较操作是否合法(不支持<,>,<=,>=操作符)
+		 *   3. 检查是否为内置操作符
+		 *   4. 检查是否包含时间列(不支持时间列操作)
+		 *   5. 递归检查子表达式
+		 *   6. 检查输入排序规则是否合法
+		 *
+		 * 注意事项:
+		 *   - 标量数组操作表达式通常用于IN/ANY/SOME等操作
+		 *   - 严格限制时间列和字符串比较操作的下推
+		 */
+	case T_ScalarArrayOpExpr:
+	{
+		ScalarArrayOpExpr *oe = (ScalarArrayOpExpr *)node;
+
+		/* 从系统缓存获取操作符信息 */
+		tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(oe->opno));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for operator %u", oe->opno);
+		form = (Form_pg_operator)GETSTRUCT(tuple);
+
+		cur_opname = pstrdup(NameStr(form->oprname));
+		ReleaseSysCache(tuple);
+
+		/* 检查字符串类型比较操作是否合法 */
+		if (tdengine_is_string_type((Node *)linitial(oe->args), &(fpinfo->slinfo)))
+		{
+			if (strcmp(cur_opname, "<") == 0 ||
+				strcmp(cur_opname, ">") == 0 ||
+				strcmp(cur_opname, "<=") == 0 ||
+				strcmp(cur_opname, ">=") == 0)
+			{
+				return false;
+			}
+		}
+
+		/* 检查是否为内置操作符 */
+		if (!tdengine_is_builtin(oe->opno))
+			return false;
+
+		/* 检查是否包含时间列 */
+		if (tdengine_contain_time_column(oe->args, &(fpinfo->slinfo)))
+		{
+			return false;
+		}
+
+		/* 递归检查子表达式 */
+		if (!tdengine_foreign_expr_walker((Node *)oe->args,
+										  glob_cxt, &inner_cxt))
+			return false;
+
+		/* 检查输入排序规则是否合法 */
+		if (oe->inputcollid == InvalidOid)
+			/* OK, inputs are all noncollatable */;
+		else if (inner_cxt.state != FDW_COLLATE_SAFE ||
+				 oe->inputcollid != inner_cxt.collation)
+			return false;
+
+		/* 输出总是布尔类型且无排序规则 */
+		collation = InvalidOid;
+		state = FDW_COLLATE_NONE;
+	}
+	break;
+		/*
+		 * 处理类型重标记节点(T_RelabelType)
+		 * 功能: 检查类型转换表达式是否可下推到远程执行
+		 *
+		 * 处理流程:
+		 *   1. 递归检查子表达式(类型转换的参数)
+		 *   2. 获取类型转换后的排序规则ID
+		 *   3. 检查排序规则是否合法:
+		 *      - 无排序规则(InvalidOid): 标记为FDW_COLLATE_NONE
+		 *      - 排序规则与子表达式一致: 标记为FDW_COLLATE_SAFE
+		 *      - 其他情况: 标记为FDW_COLLATE_UNSAFE
+		 *
+		 * 注意事项:
+		 *   - 类型重标记节点表示显式或隐式的类型转换
+		 *   - 严格检查排序规则来源，防止引入不兼容的排序规则
+		 */
+	case T_RelabelType:
+	{
+		RelabelType *r = (RelabelType *)node;
+
+		/* 递归检查子表达式 */
+		if (!tdengine_foreign_expr_walker((Node *)r->arg,
+										  glob_cxt, &inner_cxt))
+			return false;
+
+		/* 获取并检查类型转换后的排序规则 */
+		collation = r->resultcollid;
+		if (collation == InvalidOid)
+			state = FDW_COLLATE_NONE;
+		else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+				 collation == inner_cxt.collation)
+			state = FDW_COLLATE_SAFE;
+		else
+			state = FDW_COLLATE_UNSAFE;
+	}
+	break;
+		/*
+		 * 处理布尔表达式节点(T_BoolExpr)
+		 * 功能: 检查布尔表达式是否可下推到远程执行
+		 *
+		 * 处理流程:
+		 *   1. 检查布尔操作类型:
+		 *      - NOT操作符直接拒绝下推(TDengine不支持)
+		 *   2. 递归检查子表达式
+		 *   3. 特殊处理OR表达式:
+		 *      - 包含时间列的OR表达式拒绝下推
+		 *   4. 设置输出排序规则状态(布尔类型无排序规则)
+		 *
+		 * 注意事项:
+		 *   - 布尔表达式包括AND/OR/NOT逻辑操作
+		 *   - TDengine对布尔表达式的支持有限制
+		 *   - 输出总是布尔类型且无排序规则
+		 */
+	case T_BoolExpr:
+	{
+		BoolExpr *b = (BoolExpr *)node;
+
+		is_time_column = false;
+
+		/* TDengine不支持NOT操作符 */
+		if (b->boolop == NOT_EXPR)
+		{
+			return false;
+		}
+
+		/* 递归检查子表达式 */
+		if (!tdengine_foreign_expr_walker((Node *)b->args,
+										  glob_cxt, &inner_cxt))
+			return false;
+
+		/* 特殊处理OR表达式: 包含时间列则拒绝下推 */
+		if (b->boolop == OR_EXPR && is_time_column)
+		{
+			is_time_column = false;
+			return false;
+		}
+
+		/* 布尔类型无排序规则 */
+		collation = InvalidOid;
+		state = FDW_COLLATE_NONE;
+	}
+	break;
+		/*
+		 * 处理列表节点(T_List)
+		 * 功能: 检查表达式列表是否可下推到远程执行
+		 *
+		 * 处理流程:
+		 *   1. 继承外层上下文的标志位:
+		 *      - 跳过类型转换标志(can_skip_cast)
+		 *      - 填充函数启用标志(influx_fill_enable)
+		 *      - 时间键标志(has_time_key)
+		 *      - 加减操作符标志(has_sub_or_add_operator)
+		 *      - 比较操作标志(is_comparison)
+		 *   2. 递归检查列表中的每个子表达式
+		 *   3. 从子表达式继承排序规则状态:
+		 *      - 排序规则ID(collation)
+		 *      - 排序规则安全状态(state)
+		 *   4. 跳过对列表本身的类型检查
+		 *
+		 * 注意事项:
+		 *   - 列表节点通常包含多个子表达式
+		 *   - 排序规则状态由子表达式决定
+		 *   - 不直接检查列表类型，只检查其元素
+		 */
+	case T_List:
+	{
+		List *l = (List *)node;
+		ListCell *lc;
+
+		/* 继承外层上下文标志 */
+		inner_cxt.can_skip_cast = outer_cxt->can_skip_cast;
+		inner_cxt.influx_fill_enable = outer_cxt->influx_fill_enable;
+		inner_cxt.has_time_key = outer_cxt->has_time_key;
+		inner_cxt.has_sub_or_add_operator = outer_cxt->has_sub_or_add_operator;
+		inner_cxt.is_comparison = outer_cxt->is_comparison;
+
+		/* 递归检查每个子表达式 */
+		foreach (lc, l)
+		{
+			if (!tdengine_foreign_expr_walker((Node *)lfirst(lc),
+											  glob_cxt, &inner_cxt))
+				return false;
+		}
+
+		/* 从子表达式继承排序规则状态 */
+		collation = inner_cxt.collation;
+		state = inner_cxt.state;
+
+		/* 不检查列表本身的类型 */
+		check_type = false;
+	}
+	break;
+	case T_Aggref:
+	{
+		Aggref *agg = (Aggref *)node;
+		ListCell *lc;
+		char *opername = NULL;
+		bool old_val;
+		int index_const = -1;
+		int index;
+		bool is_regex = false;
+		bool is_star_func = false;
+		bool is_not_star_func = false;
+		Oid agg_inputcollid = agg->inputcollid;
+
+		/* get function name and schema */
+		opername = get_func_name(agg->aggfnoid);
+
+		// TODO: 适配tdengine
+		/* these function can be passed to TDengine */
+		if ((strcmp(opername, "sum") == 0 ||
+			 strcmp(opername, "max") == 0 ||
+			 strcmp(opername, "min") == 0 ||
+			 strcmp(opername, "count") == 0 ||
+			 strcmp(opername, "influx_distinct") == 0 || // TODO: 适配tdengine
+			 strcmp(opername, "spread") == 0 ||
+			 strcmp(opername, "sample") == 0 ||
+			 strcmp(opername, "first") == 0 ||
+			 strcmp(opername, "last") == 0 ||
+			 strcmp(opername, "integral") == 0 ||
+			 strcmp(opername, "mean") == 0 ||
+			 strcmp(opername, "median") == 0 ||
+			 strcmp(opername, "influx_count") == 0 || // TODO: 适配tdengine
+			 strcmp(opername, "influx_mode") == 0 ||
+			 strcmp(opername, "stddev") == 0 ||
+			 strcmp(opername, "influx_sum") == 0 || // TODO: 适配tdengine
+			 strcmp(opername, "influx_max") == 0 || // TODO: 适配tdengine
+			 strcmp(opername, "influx_min") == 0))	// TODO: 适配tdengine
+		{
+			is_not_star_func = true;
+		}
+
+		is_star_func = tdengine_is_star_func(agg->aggfnoid, opername);
+
+		if (!(is_star_func || is_not_star_func))
+			return false;
+
+		/* Some aggregate tdengine functions have a const argument. */
+		if (strcmp(opername, "sample") == 0 ||
+			strcmp(opername, "integral") == 0)
+			index_const = 1;
+
+		/*
+		 * Only sum(), count() and spread() are aggregate functions,
+		 * max(), min() and last() are selector functions（选择器函数）
+		 */
+		if (strcmp(opername, "sum") == 0 ||
+			strcmp(opername, "spread") == 0 ||
+			strcmp(opername, "count") == 0)
+		{
+			/* Mark target as aggregate function */
+			glob_cxt->mixing_aggref_status |= TDENGINE_TARGETS_MARK_AGGREF;
+		}
+
+		/* Not safe to pushdown when not in grouping context */
+		if (glob_cxt->foreignrel->reloptkind != RELOPT_UPPER_REL)
+			return false;
+
+		/* Only non-split aggregates are pushable. */
+		// 只有简单的、未分割的聚合函数(AGGSPLIT_SIMPLE模式)才能被下推到远程执行。
+		// 分割的聚合函数(如并行处理中的部分聚合)不被支持。
+		if (agg->aggsplit != AGGSPLIT_SIMPLE)
+			return false;
+
+		/*
+		 * Save value of is_time_column before we check time argument
+		 * aggregate.
+		 */
+		old_val = is_time_column;
+		is_time_column = false;
+
+		/*
+		 * Recurse to input args. aggdirectargs, aggorder and
+		 * aggdistinct are all present in args, so no need to check
+		 * their shippability explicitly.
+		 */
+		index = -1;
+		foreach (lc, agg->args)
+		{
+			Node *n = (Node *)lfirst(lc);
+			OpExpr *oe = (OpExpr *)NULL;
+			Oid resulttype = InvalidOid;
+			bool is_slvar = false;
+
+			index++;
+
+			/* If TargetEntry, extract the expression from it */
+			if (IsA(n, TargetEntry))
+			{
+				TargetEntry *tle = (TargetEntry *)n;
+
+				n = (Node *)tle->expr;
+
+				if (IsA(n, Var) ||
+					((index == index_const) && IsA(n, Const)))
+					/* arguments checking is OK */;
+				else if (IsA(n, Const))
+				{
+					Const *arg = (Const *)n;
+					char *extval;
+
+					if (arg->consttype == TEXTOID)
+					{
+						is_regex = tdengine_is_regex_argument(arg, &extval);
+						if (is_regex)
+							/* arguments checking is OK */;
+						else
+							return false;
+					}
+					else
+						return false;
+				}
+				else if (fpinfo->slinfo.schemaless &&
+						 (IsA(n, CoerceViaIO) || IsA(n, OpExpr)))
+				{
+					if (IsA(n, OpExpr))
+					{
+						oe = (OpExpr *)n;
+						resulttype = oe->opresulttype;
+					}
+					else
+					{
+						/* CoerceViaIO */
+						CoerceViaIO *cio = (CoerceViaIO *)n;
+						oe = (OpExpr *)cio->arg;
+						resulttype = cio->resulttype;
+					}
+
+					if (tdengine_is_slvar_fetch((Node *)oe, &(fpinfo->slinfo)))
+						is_slvar = true;
+					else
+						return false;
+				}
+				else if (is_star_func)
+					/* arguments checking is OK */;
+				else
+					return false;
+			}
+
+			/* Check if arg is Var */
+			if (IsA(n, Var) || is_slvar)
+			{
+				Var *var;
+				char *colname;
+
+				if (is_slvar)
+				{
+					Const *cnst;
+
+					var = linitial_node(Var, oe->args);
+					cnst = lsecond_node(Const, oe->args);
+					colname = TextDatumGetCString(cnst->constvalue);
+					agg_inputcollid = var->varcollid;
+				}
+				else
+				{
+					var = (Var *)n;
+
+					colname = tdengine_get_column_name(glob_cxt->relid, var->varattno);
+					resulttype = var->vartype;
+				}
+
+				/* Not push down if arg is tag key */
+				if (tdengine_is_tag_key(colname, glob_cxt->relid))
+					return false;
+
+				/*
+				 * Not push down max(), min() if arg type is text
+				 * column
+				 */
+				if ((strcmp(opername, "max") == 0 || strcmp(opername, "min") == 0) && (resulttype == TEXTOID || resulttype == InvalidOid))
+					return false;
+			}
+
+			if (!tdengine_foreign_expr_walker(n, glob_cxt, &inner_cxt))
+				return false;
+
+			/*
+			 * Does not pushdown time column argument within aggregate
+			 * function except time related functions, because these
+			 * functions are converted from func(time, value) to
+			 * func(value) when deparsing.
+			 */
+			if (is_time_column && !(strcmp(opername, "last") == 0 || strcmp(opername, "first") == 0))
+			{
+				is_time_column = false;
+				return false;
+			}
+		}
+
+		/*
+		 * If there is no time column argument within aggregate
+		 * function, restore value of is_time_column.
+		 */
+		is_time_column = old_val;
+
+		if (agg->aggorder || agg->aggfilter)
+		{
+			return false;
+		}
+
+		/*
+		 * tdengine_fdw only supports push-down DISTINCT within
+		 * aggregate for count()
+		 */
+		if (agg->aggdistinct && (strcmp(opername, "count") != 0))
+			return false;
+
+		if (is_regex)
+			check_type = false;
+		else
+		{
+			/*
+			 * If aggregate's input collation is not derived from a
+			 * foreign Var, it can't be sent to remote.
+			 */
+			if (agg_inputcollid == InvalidOid)
+				/* OK, inputs are all noncollatable */;
+			else if (inner_cxt.state != FDW_COLLATE_SAFE ||
+					 agg_inputcollid != inner_cxt.collation)
+				return false;
+		}
+
+		/*
+		 * Detect whether node is introducing a collation not derived
+		 * from a foreign Var.  (If so, we just mark it unsafe for now
+		 * rather than immediately returning false, since the parent
+		 * node might not care.)
+		 */
+		collation = agg->aggcollid;
+		if (collation == InvalidOid)
+			state = FDW_COLLATE_NONE;
+		else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+				 collation == inner_cxt.collation)
+			state = FDW_COLLATE_SAFE;
+		else if (collation == DEFAULT_COLLATION_OID)
+			state = FDW_COLLATE_NONE;
+		else
+			state = FDW_COLLATE_UNSAFE;
+	}
+	break;
+		/*
+		 * 处理类型转换节点(T_CoerceViaIO)
+		 * 功能: 检查类型转换表达式是否可下推到远程执行
+		 *
+		 * 处理流程:
+		 *   1. 检查无模式变量与时间类型的比较操作:
+		 *      - 避免下推时间键与标签/字段的时间表达式比较(如: time key = (fields->>'c2')::timestamp + interval '1d')
+		 *   2. 检查参数是否为无模式变量或参数获取表达式:
+		 *      - 是: 递归检查子表达式
+		 *      - 否: 拒绝下推
+		 *   3. 设置输出排序规则状态(类型转换无排序规则)
+		 *
+		 * 注意事项:
+		 *   - 主要用于处理显式的::类型转换操作
+		 *   - 严格限制时间类型与无模式变量的比较操作下推
+		 *   - 输出总是无排序规则状态
+		 */
+	case T_CoerceViaIO:
+	{
+		CoerceViaIO *cio = (CoerceViaIO *)node;
+		Node *arg = (Node *)cio->arg;
+
+		/* 检查时间键与无模式变量的时间类型比较 */
+		if (tdengine_is_slvar_fetch(arg, &(fpinfo->slinfo)))
+		{
+			if (TDENGINE_IS_TIME_TYPE(cio->resulttype))
+			{
+				/* 如果是比较操作且包含时间键和加减操作符则拒绝下推 */
+				if (outer_cxt->is_comparison &&
+					outer_cxt->has_sub_or_add_operator &&
+					outer_cxt->has_time_key)
+				{
+					return false;
+				}
+			}
+		}
+
+		/* 只允许无模式变量或参数获取表达式下推 */
+		if (tdengine_is_slvar_fetch(arg, &(fpinfo->slinfo)) ||
+			tdengine_is_param_fetch(arg, &(fpinfo->slinfo)))
+		{
+			/* 递归检查子表达式 */
+			if (!tdengine_foreign_expr_walker(arg, glob_cxt, &inner_cxt))
+				return false;
+		}
+		else
+		{
+			return false;
+		}
+
+		/* 类型转换无排序规则 */
+		collation = InvalidOid;
+		state = FDW_COLLATE_NONE;
+	}
+	break;
+		/*
+		 * 处理空值测试节点(T_NullTest)
+		 * 功能: 检查IS NULL/IS NOT NULL表达式是否可下推到远程执行
+		 *
+		 * 处理流程:
+		 *   1. 获取无模式变量列名(tdengine_get_slvar)
+		 *   2. 检查列名是否存在且是否为标签键(tag key):
+		 *      - 不是标签键则拒绝下推
+		 *   3. 设置输出排序规则状态(布尔类型无排序规则)
+		 *
+		 * 注意事项:
+		 *   - 仅支持对标签键(tag key)的空值测试
+		 *   - 输出总是布尔类型且无排序规则
+		 *   - 主要用于处理TDengine标签列的IS NULL/IS NOT NULL条件
+		 */
+	case T_NullTest:
+	{
+		NullTest *nt = (NullTest *)node;
+		char *colname;
+
+		/* 获取无模式变量列名 */
+		colname = tdengine_get_slvar(nt->arg, &(fpinfo->slinfo));
+
+		/* 检查是否为标签键 */
+		if (colname == NULL || !tdengine_is_tag_key(colname, glob_cxt->relid))
+			return false;
+
+		/* 布尔类型无排序规则 */
+		collation = InvalidOid;
+		state = FDW_COLLATE_NONE;
+	}
+	break;
+		/*
+		 * 处理数组表达式节点(T_ArrayExpr)
+		 * 功能: 检查数组表达式是否可下推到远程执行
+		 *
+		 * 处理流程:
+		 *   1. 递归检查数组元素子表达式
+		 *   2. 获取数组的排序规则ID(array_collid)
+		 *   3. 检查排序规则状态:
+		 *      - 无排序规则(InvalidOid): 标记为FDW_COLLATE_NONE
+		 *      - 排序规则与子表达式一致: 标记为FDW_COLLATE_SAFE
+		 *      - 默认排序规则: 标记为FDW_COLLATE_NONE
+		 *      - 其他情况: 标记为FDW_COLLATE_UNSAFE
+		 *
+		 * 注意事项:
+		 *   - 数组表达式必须从输入变量继承排序规则
+		 *   - 与函数表达式使用相同的排序规则检查逻辑
+		 *   - 默认排序规则被视为无排序规则
+		 */
+	case T_ArrayExpr:
+	{
+		ArrayExpr *a = (ArrayExpr *)node;
+
+		/* 递归检查数组元素 */
+		if (!tdengine_foreign_expr_walker((Node *)a->elements,
+										  glob_cxt, &inner_cxt))
+			return false;
+
+		/* 检查数组排序规则 */
+		collation = a->array_collid;
+		if (collation == InvalidOid)
+			state = FDW_COLLATE_NONE;
+		else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+				 collation == inner_cxt.collation)
+			state = FDW_COLLATE_SAFE;
+		else if (collation == DEFAULT_COLLATION_OID)
+			state = FDW_COLLATE_NONE;
+		else
+			state = FDW_COLLATE_UNSAFE;
+	}
+	break;
+
+	case T_DistinctExpr:
+		/* IS DISTINCT FROM */
+		return false;
+	default:
+
+		/*
+		 * If it's anything else, assume it's unsafe.  This list can be
+		 * expanded later, but don't forget to add deparse support below.
+		 */
+		return false;
+	}
+
+	/*
+	 * 如果表达式的返回类型不是内置类型，则不能下推到远程执行，
+	 * 因为可能在远程端有不兼容的语义
+	 */
+	if (check_type && !tdengine_is_builtin(exprType(node)))
+		return false;
+
+	/*
+	 * 将当前节点的排序规则信息合并到父节点的状态中
+	 */
+	if (state > outer_cxt->state)
+	{
+		/* 覆盖父节点之前的排序规则状态 */
+		outer_cxt->collation = collation;
+		outer_cxt->state = state;
+	}
+	else if (state == outer_cxt->state)
+	{
+		/* 合并排序规则状态，或检测排序规则冲突 */
+		switch (state)
+		{
+		case FDW_COLLATE_NONE:
+			/* 无排序规则 + 无排序规则 = 仍无排序规则 */
+			break;
+		case FDW_COLLATE_SAFE:
+			if (collation != outer_cxt->collation)
+			{
+				/*
+				 * 非默认排序规则总是覆盖默认排序规则
+				 */
+				if (outer_cxt->collation == DEFAULT_COLLATION_OID)
+				{
+					/* 覆盖父节点之前的排序规则状态 */
+					outer_cxt->collation = collation;
+				}
+				else if (collation != DEFAULT_COLLATION_OID)
+				{
+					/*
+					 * 排序规则冲突，将状态标记为不确定
+					 * 不立即返回false，因为父节点可能不关心排序规则
+					 */
+					outer_cxt->state = FDW_COLLATE_UNSAFE;
+				}
+			}
+			break;
+		case FDW_COLLATE_UNSAFE:
+			/* 仍然存在冲突状态... */
+			break;
+		}
+	}
+
+	/* It looks OK */
+	return true;
+}
+
+/*
+ * 检查给定的OID是否属于PostgreSQL内置对象
+ *
+ * 参数:
+ *   @oid: 要检查的对象ID
+ *
+ * 返回值:
+ *   true - 是内置对象
+ *   false - 不是内置对象
+ *
+ * 功能说明:
+ *   1. 根据PostgreSQL版本使用不同的判断标准:
+ *      - PG12+版本使用FirstGenbkiObjectId作为分界点
+ *      - 旧版本使用FirstBootstrapObjectId作为分界点
+ *   2. 所有小于分界点的OID被认为是内置对象
+ *
+ * 注意事项:
+ *   - 内置对象的OID通常是手动分配的
+ *   - 该判断方法在不同PostgreSQL版本间保持兼容
+ */
+bool tdengine_is_builtin(Oid oid)
+{
+#if (PG_VERSION_NUM >= 120000)
+	return (oid < FirstGenbkiObjectId);
+#else
+	return (oid < FirstBootstrapObjectId);
+#endif
+}
+
+/*
+ * 检查常量节点是否为正则表达式参数(以'/'开头和结尾)
+ * 参数:
+ *   @node: 常量节点指针
+ *   @extval: 输出参数，用于返回转换后的字符串值
+ * 功能说明:
+ *   1. 获取常量节点的类型输出函数
+ *   2. 将常量值转换为字符串形式
+ *   3. 检查字符串是否以'/'开头和结尾
+ * 注意事项:
+ *   - 调用者需负责释放extval返回的字符串内存
+ *   - 仅支持文本类型的正则表达式判断
+ */
+bool tdengine_is_regex_argument(Const *node, char **extval)
+{
+	Oid typoutput;	   /* 类型输出函数OID */
+	bool typIsVarlena; /* 是否为可变长度类型 */
+	const char *first; /* 字符串起始指针 */
+	const char *last;  /* 字符串结束指针 */
+
+	/* 获取类型的输出函数信息 */
+	getTypeOutputInfo(node->consttype,
+					  &typoutput, &typIsVarlena);
+
+	/* 调用输出函数将常量值转换为字符串 */
+	(*extval) = OidOutputFunctionCall(typoutput, node->constvalue);
+	first = *extval;
+	last = *extval + strlen(*extval) - 1;
+
+	/* 检查字符串是否以'/'开头和结尾 */
+	if (*first == '/' && *last == '/')
+		return true;
+	else
+		return false;
+}
+
+/*
+ * 检查函数是否为星号函数(需要添加*作为第一个参数)
+ * 参数:
+ *   @funcid: 函数OID
+ *   @in: 函数名称字符串
+ * 判断规则:
+ *   1. 排除内置函数
+ *   2. 函数名必须以"_all"结尾
+ *   3. 函数必须在TDengineStableStarFunction列表中
+ */
+bool tdengine_is_star_func(Oid funcid, char *in)
+{
+	char *eof = "_all"; /* 函数名后缀 */
+	size_t func_len = strlen(in);
+	size_t eof_len = strlen(eof);
+
+	if (tdengine_is_builtin(funcid))
+		return false;
+
+	if (func_len > eof_len && strcmp(in + func_len - eof_len, eof) == 0 &&
+		exist_in_function_list(in, TDengineStableStarFunction))
+		return true;
+
+	return false;
+}
+/*
+ * 检查函数是否为唯一函数
+ * 参数:
+ *   @funcid: 函数OID
+ *   @in: 函数名称字符串
+ * 判断规则:
+ *   1. 排除内置函数
+ *   2. 函数必须在TDengineUniqueFunction列表中
+ */
+static bool
+tdengine_is_unique_func(Oid funcid, char *in)
+{
+	if (tdengine_is_builtin(funcid))
+		return false;
+
+	if (exist_in_function_list(in, TDengineUniqueFunction))
+		return true;
+
+	return false;
+}
+/*
+ * 检查函数是否为支持的TDengine内置函数
+ * 参数:
+ *   @funcid: 函数OID
+ *   @in: 函数名称字符串
+ * 判断规则:
+ *   1. 必须是内置函数
+ *   2. 函数必须在TDengineSupportedBuiltinFunction列表中
+ */
+static bool
+tdengine_is_supported_builtin_func(Oid funcid, char *in)
+{
+	if (!tdengine_is_builtin(funcid))
+		return false;
+
+	if (exist_in_function_list(in, TDengineSupportedBuiltinFunction))
+		return true;
+
+	return false;
+}
+
+/*
+ * 检查函数名是否存在于给定的函数列表中
+ *
+ * 参数:
+ *   @funcname: 要检查的函数名称字符串
+ *   @funclist: 以NULL结尾的函数名称数组(字符串指针数组)
+ *
+ * 注意事项:
+ *   - 函数名比较区分大小写
+ */
+static bool
+exist_in_function_list(char *funcname, const char **funclist)
+{
+	int i;
+
+	for (i = 0; funclist[i]; i++)
+	{
+		if (strcmp(funcname, funclist[i]) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * tdengine_get_data_type_name: 根据数据类型OID获取类型名称
+ *
+ * 参数:
+ *   @data_type_id: 要查询的数据类型OID
+ *
+ * 返回值:
+ *   成功: 返回类型名称字符串(需调用者释放内存)
+ *   失败: 抛出错误
+ *
+ * 功能说明:
+ *   1. 通过系统缓存查询数据类型信息
+ *   2. 提取类型名称并返回其副本
+ *   3. 调用者需负责释放返回的字符串内存
+ *
+ * 注意事项:
+ *   - 使用pstrdup分配内存，需用pfree释放
+ *   - 如果找不到对应类型会抛出ERROR
+ */
+char *tdengine_get_data_type_name(Oid data_type_id)
+{
+	HeapTuple tuple;   /* 系统缓存元组 */
+	Form_pg_type type; /* 类型信息结构体 */
+	char *type_name;   /* 返回的类型名称 */
+
+	/* 从系统缓存查询类型信息 */
+	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(data_type_id));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for data type id %u", data_type_id);
+
+	/* 获取类型结构体并复制类型名称 */
+	type = (Form_pg_type)GETSTRUCT(tuple);
+	/* 总是返回类型名称的副本 */
+	type_name = pstrdup(type->typname.data);
+
+	/* 释放系统缓存元组 */
+	ReleaseSysCache(tuple);
+	return type_name;
+}
+
+/*
+ * tdengine_is_select_all: 检查是否为全表查询(select *)
+ *
+ * 参数:
+ *   @rte: 范围表条目
+ *   @tlist: 目标列表
+ *   @pslinfo: 无模式信息结构体指针
+ *
+ * 返回值:
+ *   true - 是全表查询或需要所有列的情况
+ *   false - 不是全表查询
+ *
+ * 功能说明:
+ *   1. 检查目标列表是否包含所有有效列
+ *   2. 处理以下特殊情况:
+ *      - 包含关系类型ID的变量
+ *      - 包含整行引用(varattno=0)
+ *      - 包含无模式类型变量
+ *   3. 统计匹配的列数
+ *
+ * 处理流程:
+ *   1. 打开表获取元组描述符
+ *   2. 遍历所有属性
+ *   3. 跳过已删除的属性
+ *   4. 检查目标列表中的每个变量
+ *   5. 判断是否满足全表查询条件
+ */
+bool tdengine_is_select_all(RangeTblEntry *rte, List *tlist, schemaless_info *pslinfo)
+{
+	int i;
+	int natts = 0;
+	int natts_valid = 0;
+	Relation rel = table_open(rte->relid, NoLock);
+	TupleDesc tupdesc = RelationGetDescr(rel);
+	Oid rel_type_id;
+	bool has_rel_type_id = false;
+	bool has_slcol = false;
+	bool has_wholerow = false;
+
+	/* 打开表并获取元组描述符 */
+	Relation rel = table_open(rte->relid, NoLock);
+	TupleDesc tupdesc = RelationGetDescr(rel);
+
+	/* 获取关系类型ID */
+	rel_type_id = get_rel_type_id(rte->relid);
+
+	/* 遍历表的所有属性 */
+	for (i = 1; i <= tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
+		ListCell *lc;
+
+		/* 跳过已删除的属性 */
+		if (attr->attisdropped)
+			continue;
+
+		/* 遍历目标列表 */
+		foreach (lc, tlist)
+		{
+			Node *node = (Node *)lfirst(lc);
+
+			if (IsA(node, TargetEntry))
+				node = (Node *)((TargetEntry *)node)->expr;
+
+			if (IsA(node, Var))
+			{
+				Var *var = (Var *)node;
+
+				/* 检查关系类型ID匹配 */
+				if (var->vartype == rel_type_id)
+				{
+					has_rel_type_id = true;
+					break;
+				}
+
+				/* 检查整行引用 */
+				if (var->varattno == 0)
+				{
+					has_wholerow = true;
+					break;
+				}
+
+				/* 检查无模式类型变量 */
+				if (tdengine_is_slvar(var->vartype, var->varattno, pslinfo, NULL, NULL))
+				{
+					has_slcol = true;
+					break;
+				}
+
+				/* 检查属性匹配 */
+				if (var->varattno == attr->attnum)
+				{
+					natts++;
+					break;
+				}
+			}
+		}
+	}
+
+	/* 关闭表并返回结果 */
+	table_close(rel, NoLock);
+	return ((natts == natts_valid) || has_rel_type_id || has_slcol || has_wholerow);
+}
+
+/*
+ * 检查表达式列表中是否包含时间列
+ *
+ * 参数:
+ *   @exprs: 要检查的表达式列表
+ *   @pslinfo: 无模式信息结构体指针
+ *
+ * 功能说明:
+ *   1. 遍历表达式列表中的每个表达式
+ *   2. 检查表达式类型:
+ *      - 如果是Var类型(列引用)，检查其数据类型是否为时间类型
+ *      - 如果是CoerceViaIO类型(类型转换)，检查其参数是否为时间键列且转换结果为时间类型
+ *   3. 发现时间列立即返回true
+ *
+ * 注意事项:
+ *   - 依赖于TDENGINE_IS_TIME_TYPE宏定义来判断时间类型
+ *   - 对于CoerceViaIO类型，会调用tdengine_contain_time_key_column进行递归检查
+ */
+static bool
+tdengine_contain_time_column(List *exprs, schemaless_info *pslinfo)
+{
+	ListCell *lc;
+
+	foreach (lc, exprs)
+	{
+		Expr *expr = (Expr *)lfirst(lc);
+
+		if (IsA(expr, Var))
+		{
+			Var *var = (Var *)expr;
+
+			if (TDENGINE_IS_TIME_TYPE(var->vartype))
+			{
+				return true;
+			}
+		}
+		else if (IsA(expr, CoerceViaIO))
+		{
+			CoerceViaIO *cio = (CoerceViaIO *)expr;
+			Node *arg = (Node *)cio->arg;
+
+			if (tdengine_contain_time_key_column(arg, pslinfo))
+			{
+				if (TDENGINE_IS_TIME_TYPE(cio->resulttype))
+				{
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+/*
+ * 检查表达式列表中是否包含时间键列
+ *
+ * 参数:
+ *   @relid: 外表OID
+ *   @exprs: 表达式列表
+ *
+ * 功能说明:
+ *   1. 遍历表达式列表中的每个表达式
+ *   2. 检查表达式是否为Var类型(列引用)
+ *   3. 检查列是否为时间类型(TDENGINE_IS_TIME_TYPE)
+ *   4. 获取列名并检查是否为时间键列(TDENGINE_IS_TIME_COLUMN)
+ *
+ * 注意事项:
+ *   - 仅检查Var类型的表达式节点
+ *   - 依赖于TDENGINE_IS_TIME_TYPE和TDENGINE_IS_TIME_COLUMN宏定义
+ */
+static bool
+tdengine_contain_time_key_column(Oid relid, List *exprs)
+{
+	ListCell *lc;
+
+	/* 遍历表达式列表 */
+	foreach (lc, exprs)
+	{
+		Expr *expr = (Expr *)lfirst(lc);
+		Var *var;
+
+		/* 跳过非Var类型的表达式 */
+		if (!IsA(expr, Var))
+			continue;
+
+		var = (Var *)expr;
+
+		/* 检查变量类型是否为时间类型 */
+		if (TDENGINE_IS_TIME_TYPE(var->vartype))
+		{
+			/* 获取列名并检查是否为时间关键列 */
+			char *column_name = tdengine_get_column_name(relid, var->varattno);
+
+			if (TDENGINE_IS_TIME_COLUMN(column_name))
+				return true;
+		}
+	}
+
+	return false;
+}
+/*
+ * 检查表达式列表中是否包含时间表达式(排除Var/Const/Param/FuncExpr类型节点)
+ *
+ * 参数:
+ *   @exprs: 要检查的表达式列表
+ *
+ * 功能说明:
+ *   1. 遍历表达式列表中的每个表达式
+ *   2. 跳过Var/Const/Param/FuncExpr类型的节点
+ *   3. 检查剩余节点的返回类型是否为时间类型
+ *   4. 发现时间类型表达式立即返回true
+ *
+ * 注意事项:
+ *   - 仅检查非基本表达式节点(Var/Const/Param/FuncExpr除外)
+ *   - 依赖于TDENGINE_IS_TIME_TYPE宏定义来判断时间类型
+ */
+static bool
+tdengine_contain_time_expr(List *exprs)
+{
+	ListCell *lc;
+
+	foreach (lc, exprs)
+	{
+		Expr *expr = (Expr *)lfirst(lc);
+		Oid type;
+
+		if (IsA(expr, Var) ||
+			IsA(expr, Const) ||
+			IsA(expr, Param) ||
+			IsA(expr, FuncExpr))
+		{
+			continue;
+		}
+
+		type = exprType((Node *)expr);
+
+		if (TDENGINE_IS_TIME_TYPE(type))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+/*
+ * 检查表达式列表中是否包含时间函数
+ *
+ * 参数:
+ *   @exprs: 要检查的表达式列表
+ *
+ * 功能说明:
+ *   1. 遍历表达式列表中的每个表达式
+ *   2. 检查表达式是否为函数表达式(FuncExpr类型)
+ *   3. 检查函数返回类型是否为时间类型(TDENGINE_IS_TIME_TYPE)
+ *   4. 发现时间函数立即返回true
+ *
+ * 注意事项:
+ *   - 仅检查FuncExpr类型的表达式节点
+ *   - 依赖于TDENGINE_IS_TIME_TYPE宏定义来判断时间类型
+ */
+static bool
+tdengine_contain_time_function(List *exprs)
+{
+	ListCell *lc;
+
+	foreach (lc, exprs)
+	{
+		Expr *expr = (Expr *)lfirst(lc);
+		FuncExpr *func_expr;
+
+		if (!IsA(expr, FuncExpr))
+			continue;
+
+		func_expr = (FuncExpr *)expr;
+
+		if (TDENGINE_IS_TIME_TYPE(func_expr->funcresulttype))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+/*
+ * 检查表达式列表中是否包含时间类型的参数节点(Param)
+ *
+ * 参数:
+ *   @exprs: 要检查的表达式列表
+ *
+ * 功能说明:
+ *   1. 遍历表达式列表中的每个表达式
+ *   2. 检查表达式是否为参数节点(Param类型)
+ *   3. 获取参数节点的数据类型
+ *   4. 检查数据类型是否为时间类型(TDENGINE_IS_TIME_TYPE)
+ *   5. 发现时间类型参数立即返回true
+ *
+ * 注意事项:
+ *   - 仅检查Param类型的表达式节点
+ *   - 依赖于TDENGINE_IS_TIME_TYPE宏定义来判断时间类型
+ */
+static bool
+tdengine_contain_time_param(List *exprs)
+{
+	ListCell *lc;
+
+	foreach (lc, exprs)
+	{
+		Expr *expr = (Expr *)lfirst(lc);
+		Oid type;
+
+		if (!IsA(expr, Param))
+			continue;
+
+		type = exprType((Node *)expr);
+
+		if (TDENGINE_IS_TIME_TYPE(type))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+/*
+ * 检查表达式列表中是否包含时间类型的常量节点(Const)
+ *
+ * 参数:
+ *   @exprs: 要检查的表达式列表
+ *
+ * 功能说明:
+ *   1. 遍历表达式列表中的每个表达式
+ *   2. 检查表达式是否为常量节点(Const类型)
+ *   3. 获取常量节点的数据类型
+ *   4. 检查数据类型是否为时间类型(TDENGINE_IS_TIME_TYPE)
+ *   5. 发现时间类型常量立即返回true
+ *
+ * 注意事项:
+ *   - 仅检查Const类型的表达式节点
+ *   - 依赖于TDENGINE_IS_TIME_TYPE宏定义来判断时间类型
+ */
+static bool
+tdengine_contain_time_const(List *exprs)
+{
+	ListCell *lc;
+
+	foreach (lc, exprs)
+	{
+		Expr *expr = (Expr *)lfirst(lc);
+		Oid type;
+
+		if (!IsA(expr, Const))
+			continue;
+
+		type = exprType((Node *)expr);
+
+		if (TDENGINE_IS_TIME_TYPE(type))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * 获取外表对应的远程表名
+ *
+ * 参数:
+ *   @rel: 本地Relation对象
+ *
+ * 功能说明:
+ *   1. 首先从外表的FDW选项中查找"table"定义
+ *   2. 如果未找到自定义表名，则使用Relation对象自身的名称
+ *
+ * 注意事项:
+ *   - 返回的字符串指针由调用者管理，不应释放
+ *   - 优先使用FDW选项中定义的表名
+ */
+char *
+tdengine_get_table_name(Relation rel)
+{
+	ForeignTable *table;
+	char *relname = NULL;
+	ListCell *lc = NULL;
+
+	/* 获取外表元数据 */
+	table = GetForeignTable(RelationGetRelid(rel));
+
+	/*
+	 * 优先使用FDW选项中定义的表名
+	 * 而不是Relation对象自身的名称
+	 */
+	foreach (lc, table->options)
+	{
+		DefElem *def = (DefElem *)lfirst(lc);
+
+		if (strcmp(def->defname, "table") == 0)
+			relname = defGetString(def);
+	}
+
+	/* 未找到FDW选项中的表名则使用Relation标准名称 */
+	if (relname == NULL)
+		relname = RelationGetRelationName(rel);
+
+	return relname;
+}
+
+/*
+ * 获取外表中指定列的列名
+ *
+ * 参数:
+ *   @relid: 外表OID
+ *   @attnum: 列属性编号
+ *
+ * 功能说明:
+ *   1. 首先从外表的列选项中查找"column_name"定义
+ *   2. 如果未找到自定义列名，则从系统目录获取默认列名
+ *
+ * 注意事项:
+ *   - 返回的字符串指针由调用者管理，不应释放
+ *   - 兼容PostgreSQL 11+版本
+ */
+char *
+tdengine_get_column_name(Oid relid, int attnum)
+{
+	List *options = NULL;
+	ListCell *lc_opt;
+	char *colname = NULL;
+
+	/* 获取外表的列选项 */
+	options = GetForeignColumnOptions(relid, attnum);
+
+	/* 遍历选项查找自定义列名 */
+	foreach (lc_opt, options)
+	{
+		DefElem *def = (DefElem *)lfirst(lc_opt);
+
+		if (strcmp(def->defname, "column_name") == 0)
+		{
+			colname = defGetString(def);
+			break;
+		}
+	}
+
+	/* 未找到自定义列名则获取系统默认列名 */
+	if (colname == NULL)
+		colname = get_attname(relid, attnum
+#if (PG_VERSION_NUM >= 110000)
+							  ,
+							  false /* 不抛出错误 */
+#endif
+		);
+	return colname;
+}
+
+/*
+ * 检查指定列是否为标签键(tag key)
+ *
+ * 参数:
+ *   @colname: 要检查的列名
+ *   @reloid: 表对象ID
+ *
+ * 处理流程:
+ *   1. 获取表的FDW选项配置
+ *   2. 检查tags_list是否为空(空表示所有列都是字段)
+ *   3. 遍历tags_list检查列名是否匹配
+ *
+ *   - 该函数用于确定列的分类以便正确处理查询下推
+ */
+bool tdengine_is_tag_key(const char *colname, Oid reloid)
+{
+	tdengine_opt *options;
+	ListCell *lc;
+
+	/* 获取表的FDW选项配置 */
+	options = tdengine_get_options(reloid, GetUserId());
+
+	/* 如果tags_list为空，表示所有列都是字段 */
+	if (!options->tags_list)
+		return false;
+
+	/* 遍历tags_list检查列名是否匹配 */
+	foreach (lc, options->tags_list)
+	{
+		char *name = (char *)lfirst(lc);
+
+		if (strcmp(colname, name) == 0)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * 检查节点是否为字符串类型
+ *
+ * 参数:
+ *   @node: 要检查的语法树节点
+ *   @pslinfo: 无模式信息结构体指针
+ *
+ * 功能说明:
+ *   1. 处理不同类型的节点:
+ *      - Var节点: 获取变量类型
+ *      - Const节点: 获取常量类型
+ *      - OpExpr节点: 处理操作符表达式
+ *      - CoerceViaIO节点: 处理类型转换表达式
+ *      - 其他节点: 递归检查子节点
+ *   2. 检查类型OID是否为字符串类型(CHAROID/VARCHAROID/TEXTOID/BPCHAROID/NAMEOID)
+ *
+ * 注意事项:
+ *   - 使用expression_tree_walker递归处理子节点
+ *   - 对于无模式变量会调用influxdb_is_slvar_fetch进行特殊处理
+ */
+static bool
+influxdb_is_string_type(Node *node, schemaless_info *pslinfo)
+{
+	Oid oidtype = 0;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var *var = (Var *)node;
+		oidtype = var->vartype;
+	}
+	else if (IsA(node, Const))
+	{
+		Const *c = (Const *)node;
+		oidtype = c->consttype;
+	}
+	else if (IsA(node, OpExpr))
+	{
+		OpExpr *oe = (OpExpr *)node;
+
+		if (influxdb_is_slvar_fetch(node, pslinfo))
+		{
+			oidtype = oe->opresulttype;
+		}
+		else
+			return expression_tree_walker(node, influxdb_is_string_type, pslinfo);
+	}
+	else if (IsA(node, CoerceViaIO))
+	{
+		CoerceViaIO *cio = (CoerceViaIO *)node;
+		Node *arg = (Node *)cio->arg;
+
+		if (influxdb_is_slvar_fetch(arg, pslinfo))
+		{
+			oidtype = cio->resulttype;
+		}
+		else
+			return expression_tree_walker(node, influxdb_is_string_type, pslinfo);
+	}
+	else
+	{
+		return expression_tree_walker(node, influxdb_is_string_type, pslinfo);
+	}
+
+	switch (oidtype)
+	{
+	case CHAROID:
+	case VARCHAROID:
+	case TEXTOID:
+	case BPCHAROID:
+	case NAMEOID:
+		return true;
+	default:
+		return false;
+	}
+}

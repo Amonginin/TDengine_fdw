@@ -103,22 +103,41 @@ enum FdwPathPrivateIndex
     FdwPathPrivateHasLimit,
 };
 
-
-
 /*
- * Library load-time initialization, sets on_proc_exit() callback for
- * backend shutdown.
+ * PostgreSQL扩展初始化函数
+ * 1. 在PostgreSQL加载扩展时自动调用
+ * 2. 注册进程退出回调函数，确保资源正确释放
+ * 3. 使用on_proc_exit机制保证无论进程如何退出都会执行清理
+ * 
+ * 无显式参数，遵循PostgreSQL扩展初始化函数标准格式
+ * 
+ * 回调机制：
+ * - 注册tdengine_fdw_exit作为退出处理函数
+ * - 传递NULL作为回调参数
+ * 
+ * 注意事项：
+ * 1. 必须在扩展加载时调用
+ * 2. 是PostgreSQL扩展的标准入口点
  */
 void _PG_init(void)
 {
+    /* 注册进程退出回调函数 */
     on_proc_exit(&tdengine_fdw_exit, PointerGetDatum(NULL));
 }
+
 /*
- * tdengine_fdw_exit: Exit callback function.
+ * TDengine FDW 退出回调函数
+ * 1. 在PostgreSQL进程退出时被调用
+ * 2. 负责清理TDengine客户端连接资源
+ * 3. 确保不会出现资源泄漏
+ * 
+ * @code 退出状态码
+ * @arg 回调参数(未使用)
  */
 static void
 tdengine_fdw_exit(int code, Datum arg)
 {
+    /* 清理TDengine C++客户端连接 */
     cleanup_cxx_client_connection();
 }
 
@@ -916,13 +935,11 @@ tdengineBeginForeignScan(ForeignScanState *node, int eflags)
 
     /* 获取选项 */
     festate->tdengineFdwOptions = tdengine_get_options(rte->relid, userid);
-// #ifdef CXX_CLIENT
     if (!festate->tdengineFdwOptions->svr_version)
         festate->tdengineFdwOptions->svr_version = tdengine_get_version_option(festate->tdengineFdwOptions);
     /* 获取用户映射 */
     ftable = GetForeignTable(rte->relid);
     festate->user = GetUserMapping(userid, ftable->serverid);
-// #endif
 
     tdengine_get_schemaless_info(&(festate->slinfo), schemaless, rte->relid);
 
@@ -1051,16 +1068,10 @@ tdengineIterateForeignScan(ForeignScanState *node)
                 // 打印错误信息
                 elog(ERROR, "tdengine_fdw : %s", err);
             }
-// #ifdef CXX_CLIENT
-            // 使用 C++ 客户端时，ret.r0 是结果集指针
+
             result = ret.r0;
             festate->temp_result = (void *) result;
-// #else
-//             // 普通方式时，获取结果集
-//             result = &ret.r0;
-//             // 复制结果集
-//             copyTDengineResult(festate, result);
-// #endif
+
             // 获取结果集的行数
             festate->row_nums = result->nrow;
             // 打印查询信息

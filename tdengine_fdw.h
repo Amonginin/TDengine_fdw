@@ -1,36 +1,77 @@
-// #ifdef GO_CLIENT
-// #include "_obj/_cgo_export.h"
-// #else
-// #ifdef CXX_CLIENT
 #include "query_cxx.h"
-// #endif
-// #endif
+
 
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 
-// #if (PG_VERSION_NUM >= 120000)
 #include "nodes/pathnodes.h"
 #include "utils/float.h"
 #include "optimizer/optimizer.h"
 #include "access/table.h"
 #include "fmgr.h"
-// #else
-// #include "nodes/relation.h"
-// #include "optimizer/var.h"
-// #endif
 
 #include "utils/rel.h"
+
+/* 等待超时时间设置(毫秒)，0表示无限等待 */
+#define WAIT_TIMEOUT		0
+/* 交互式查询超时时间设置(毫秒)，0表示不超时 */ 
+#define INTERACTIVE_TIMEOUT 0
+
+/* TDengine兼容模式下的时间列名定义 */
+#define TDENGINE_TIME_COLUMN "time"
+/* TDengine兼容模式下的文本格式时间列名 */
+#define TDENGINE_TIME_TEXT_COLUMN "time_text"
+/* TDengine兼容模式下的标签列名 */ 
+#define TDENGINE_TAGS_COLUMN "tags"
+/* TDengine兼容模式下的字段列名 */
+#define TDENGINE_FIELDS_COLUMN "fields"
+
+/* TDengine标签列在PostgreSQL中的数据类型 */
+#define TDENGINE_TAGS_PGTYPE "jsonb"
+/* TDengine字段列在PostgreSQL中的数据类型 */
+#define TDENGINE_FIELDS_PGTYPE "jsonb"
+
+/* 判断列名是否为时间列(TDengine兼容模式) */
+#define TDENGINE_IS_TIME_COLUMN(X) (strcmp(X, TDENGINE_TIME_COLUMN) == 0 || \
+									strcmp(X, TDENGINE_TIME_TEXT_COLUMN) == 0)
+/* 判断类型是否为时间类型 */                                    
+#define TDENGINE_IS_TIME_TYPE(typeoid) ((typeoid == TIMESTAMPTZOID) || \
+										(typeoid == TIMEOID) ||        \
+										(typeoid == TIMESTAMPOID))
+/* 无错误返回码定义 */                                        
+#define CR_NO_ERROR 0
+
+
+/*
+ * 宏定义：用于检查目标列表中聚合函数和非聚合函数的混合情况
+ *
+ * 定义说明:
+ *   TDENGINE_TARGETS_MARK_COLUMN - 标记目标列表中的普通列(非聚合) (二进制位0)
+ *   TDENGINE_TARGETS_MARK_AGGREF - 标记目标列表中的聚合函数 (二进制位1)
+ *   TDENGINE_TARGETS_MIXING_AGGREF_UNSAFE - 表示同时包含普通列和聚合函数的不安全混合状态
+ *   TDENGINE_TARGETS_MIXING_AGGREF_SAFE - 表示安全状态(无混合或仅单一种类)
+ *
+ * 使用场景:
+ *   在查询计划阶段检查目标列表是否可以安全下推到TDengine服务器执行
+ *   当同时存在普通列和聚合函数时(TDENGINE_TARGETS_MIXING_AGGREF_UNSAFE)，
+ *   表示这种混合状态不能安全下推，需要在PostgreSQL端处理
+ */
+#define TDENGINE_TARGETS_MARK_COLUMN            (1u << 0)
+#define TDENGINE_TARGETS_MARK_AGGREF            (1u << 1)
+#define TDENGINE_TARGETS_MIXING_AGGREF_UNSAFE   (TDENGINE_TARGETS_MARK_COLUMN | TDENGINE_TARGETS_MARK_AGGREF)
+#define TDENGINE_TARGETS_MIXING_AGGREF_SAFE     (0u)
 
 #define CODE_VERSION 20200
 
 /*
  * 用于存储 TDengine 服务器信息的选项结构体
+ * TODO: 支持超级表
  */
 typedef struct tdengine_opt {
     char    *driver;        /* TDengine 驱动名，如 "taos" 或 "tmq" */
     char    *protocol;      /* 连接协议，如 "taos+ws" 等 */
     char    *svr_database;  /* TDengine 数据库名称（可选） */
+    char    *svr_table;     /* TDengine 表名称（可选） */
     char    *svr_address;   /* TDengine 服务器 IP 地址 */
     int      svr_port;      /* TDengine 端口号 */
     char    *svr_username;  /* TDengine 用户名 */
@@ -41,7 +82,7 @@ typedef struct tdengine_opt {
 
 typedef struct schemaless_info
 {
-    bool		schemaless;		/* 启用无模式检查 */
+    bool		schemaless;		/* 启用无模式 */
     Oid			slcol_type_oid; /* 无模式列的 jsonb 类型的对象标识符（OID） */
     Oid			jsonb_op_oid;	/* jsonb 类型 "->>" 箭头操作符的对象标识符（OID） */
 
