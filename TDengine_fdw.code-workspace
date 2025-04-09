@@ -2,12 +2,6 @@
 	"folders": [
 		{
 			"path": "."
-		},
-		{
-			"path": "../influxdb-cxx"
-		},
-		{
-			"path": "../influxdb_fdw"
 		}
 	],
 	"settings": {
@@ -27,7 +21,39 @@
 			"table.h": "c",
 			"fmgr.h": "c",
 			"rel.h": "c",
-			"pathnodes.h": "c"
+			"pathnodes.h": "c",
+			"lsyscache.h": "c",
+			"miscadmin.h": "c",
+			"*.tcc": "c",
+			"ratio": "c",
+			"system_error": "c",
+			"array": "c",
+			"functional": "c",
+			"regex": "c",
+			"tuple": "c",
+			"type_traits": "c",
+			"utility": "c",
+			"variant": "c",
+			"pg_collation.h": "c",
+			"guc.h": "c",
+			"htup_details.h": "c",
+			"influxdb_fdw.h": "c",
+			"sysattr.h": "c",
+			"heapam.h": "c",
+			"parsenodes.h": "c",
+			"chrono": "c",
+			"compare": "c",
+			"query_cxx.h": "c"
+		},
+		"marscode.codeCompletionPro": {
+			"enableCodeCompletionPro": true
+		},
+		"marscode.chatLanguage": "cn",
+		"marscode.enableInlineCommand": true,
+		"marscode.enableCodelens": {
+			"enableInlineDocumentation": true,
+			"enableInlineUnitTest": true,
+			"enableInlineExplain": true
 		}
 	}
 }

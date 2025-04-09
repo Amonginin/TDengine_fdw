@@ -1,12 +1,53 @@
 
 #include <sstream>
 
+#include "connection.hpp"
 
 extern "C"
 {
 #include "query_cxx.h"
 }
 
+/*
+ * bindParameter
+ *      bind parameter to prepare for query exection
+ */
+static influxdb::InfluxDBParams
+bindParameter(InfluxDBType *param_type, InfluxDBValue *param_val, int param_num)
+{
+    influxdb::InfluxDBParams params;
+
+    if (param_num > 0)
+    {
+        for (int i = 0; i < param_num; i++)
+        {
+            /* Each placeholder is "$1", "$2",...,so set "1","2",... to map key */
+            switch (param_type[i])
+            {
+                case INFLUXDB_STRING:
+                    params.addParam(std::to_string(i + 1), std::string(param_val[i].s));
+                    break;
+                case INFLUXDB_INT64:
+                case INFLUXDB_TIME:
+                    params.addParam(std::to_string(i + 1), param_val[i].i);
+                    break;
+                case INFLUXDB_BOOLEAN:
+                    params.addParam(std::to_string(i + 1), (bool) param_val[i].b);
+                    break;
+                case INFLUXDB_DOUBLE:
+                    params.addParam(std::to_string(i + 1), param_val[i].d);
+                    break;
+                case INFLUXDB_NULL:
+                    params.addParam(std::to_string(i + 1), "\"\"");
+                    break;
+                default:
+                    elog(ERROR, "Unexpected type: %d", param_type[i]);
+            }
+        }
+    }
+
+    return params;
+}
 /*
  * TDengineQuery
  *      execute single InfluxQL query

@@ -35,6 +35,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
@@ -87,6 +88,32 @@ static TupleTableSlot *tdengineIterateForeignScan(ForeignScanState *node);
 static void tdengineReScanForeignScan(ForeignScanState *node);
 // 释放整个ForeignScan算子执行过程中占用的外部资源或FDW中的资源
 static void tdengineEndForeignScan(ForeignScanState *node);
+
+static void influxdb_to_pg_type(StringInfo str, char *typname);
+
+static void prepare_query_params(PlanState *node,
+								 List *fdw_exprs,
+								 List *remote_exprs,
+								 Oid foreigntableid,
+								 int numParams,
+								 FmgrInfo **param_flinfo,
+								 List **param_exprs,
+								 const char ***param_values,
+								 Oid **param_types,
+								 TDengineType * *param_influxdb_types,
+								 TDengineValue * *param_influxdb_values,
+								 TDengineColumnInfo * *param_column_info);
+
+static void process_query_params(ExprContext *econtext,
+								 FmgrInfo *param_flinfo,
+								 List *param_exprs,
+								 const char **param_values,
+								 Oid *param_types,
+								 TDengineType * param_influxdb_types,
+								 TDengineValue * param_influxdb_values,
+								 TDengineColumnInfo *param_column_info);
+
+static void create_cursor(ForeignScanState *node);
 
 /*
  * 此枚举描述了 ForeignPath 的 fdw_private 列表中存储的内容。
@@ -935,8 +962,8 @@ tdengineBeginForeignScan(ForeignScanState *node, int eflags)
 
     /* 获取选项 */
     festate->tdengineFdwOptions = tdengine_get_options(rte->relid, userid);
-    if (!festate->tdengineFdwOptions->svr_version)
-        festate->tdengineFdwOptions->svr_version = tdengine_get_version_option(festate->tdengineFdwOptions);
+    // if (!festate->tdengineFdwOptions->svr_version)
+    //     festate->tdengineFdwOptions->svr_version = tdengine_get_version_option(festate->tdengineFdwOptions);
     /* 获取用户映射 */
     ftable = GetForeignTable(rte->relid);
     festate->user = GetUserMapping(userid, ftable->serverid);
@@ -1047,7 +1074,7 @@ tdengineIterateForeignScan(ForeignScanState *node)
             // festate->rows 需要比每行更长的上下文
             oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 // #ifdef CXX_CLIENT
-            // 使用 C++ 客户端执行查询
+            // TODO: 使用 C++ 客户端执行查询
             ret = TDengineQuery(festate->query, festate->user, options,
 // #else
 //             // 使用普通方式执行查询
@@ -1179,6 +1206,331 @@ tdengineEndForeignScan(ForeignScanState *node)
 	}
 }
 
+
+/*
+ * 设置数据传输模式
+ * 功能: 强制设置GUC参数以确保数据值以远程服务器明确的形式输出
+ *
+ * 返回值:
+ *   int - 必须传递给reset_transmission_modes()的嵌套级别
+ *
+ * 处理流程:
+ *   1. 创建新的GUC嵌套级别
+ *   2. 检查并设置日期格式为ISO标准(如果当前不是)
+ *   3. 检查并设置间隔样式为Postgres风格(如果当前不是)
+ *   4. 检查并设置浮点精度至少为3位(如果当前小于3)
+ *   5. 强制设置搜索路径为pg_catalog以确保regproc等常量正确打印
+ *
+ * 注意事项:
+ *   - 这些设置与pg_dump使用的值保持一致
+ *   - 使用函数SET选项使设置仅持续到调用reset_transmission_modes()
+ *   - 如果中间发生错误，guc.c会自动撤销这些设置
+ *   - 每次行处理都需要调用，因为不能保留设置以免影响用户可见的计算
+ */
+int
+tdengine_set_transmission_modes(void)
+{
+	// 创建新的GUC嵌套级别
+	int nestlevel = NewGUCNestLevel();
+
+	/* 设置日期格式为ISO标准 */
+	if (DateStyle != USE_ISO_DATES)
+		(void) set_config_option("datestyle", "ISO",
+								PGC_USERSET, PGC_S_SESSION,
+								GUC_ACTION_SAVE, true, 0, false);
+
+	/* 设置间隔样式为Postgres风格 */
+	if (IntervalStyle != INTSTYLE_POSTGRES)
+		(void) set_config_option("intervalstyle", "postgres",
+								PGC_USERSET, PGC_S_SESSION,
+								GUC_ACTION_SAVE, true, 0, false);
+
+	/* 设置浮点精度至少为3位 */
+	if (extra_float_digits < 3)
+		(void) set_config_option("extra_float_digits", "3",
+								PGC_USERSET, PGC_S_SESSION,
+								GUC_ACTION_SAVE, true, 0, false);
+
+	/* 强制设置搜索路径为pg_catalog */
+	(void) set_config_option("search_path", "pg_catalog",
+							PGC_USERSET, PGC_S_SESSION,
+							GUC_ACTION_SAVE, true, 0, false);
+
+	return nestlevel;
+}
+
+/*
+ * 重置数据传输模式
+ * 功能: 撤销tdengine_set_transmission_modes()设置的GUC参数
+ *
+ * 参数:
+ *   @nestlevel: 由tdengine_set_transmission_modes()返回的嵌套级别
+ *
+ * 处理流程:
+ *   1. 调用AtEOXact_GUC函数回滚到指定嵌套级别的GUC设置
+ *   2. 参数true表示在事务结束时执行重置
+ *
+ * 注意事项:
+ *   - 必须与tdengine_set_transmission_modes()配对使用
+ *   - 通常在查询处理完成后调用
+ *   - 如果中间发生错误会自动调用
+ */
+void
+tdengine_reset_transmission_modes(int nestlevel)
+{
+	AtEOXact_GUC(true, nestlevel);
+}
+
+/*
+ * 准备远程查询中使用的参数
+ * 功能: 为远程查询中使用的参数准备输出转换和相关信息
+ *
+ * 参数:
+ *   @node: 计划状态节点
+ *   @fdw_exprs: FDW表达式列表
+ *   @remote_exprs: 远程表达式列表
+ *   @foreigntableid: 外部表OID
+ *   @numParams: 参数数量
+ *   @param_flinfo: 输出参数，存储参数的类型输出函数信息
+ *   @param_exprs: 输出参数，存储参数表达式列表
+ *   @param_values: 输出参数，存储参数的文本形式值
+ *   @param_types: 输出参数，存储参数的类型OID
+ *   @param_tdengine_types: 输出参数，存储参数的TDengine类型
+ *   @param_tdengine_values: 输出参数，存储参数的TDengine值
+ *   @param_column_info: 输出参数，存储参数相关的列信息
+ *
+ * 处理流程:
+ *   1. 验证参数数量必须大于0
+ *   2. 分配各种参数信息的内存空间
+ *   3. 遍历每个FDW表达式:
+ *      a. 获取参数表达式类型
+ *      b. 获取类型输出函数信息
+ *      c. 如果是时间类型参数:
+ *         i. 检查参数是否在远程表达式中
+ *         ii. 提取相关列信息
+ *         iii. 根据列名确定列类型(时间键/标签键/字段键)
+ *   4. 初始化参数表达式列表
+ *   5. 分配参数值缓冲区
+ */
+static void
+prepare_query_params(PlanState *node,
+                     List *fdw_exprs,
+                     List *remote_exprs,
+                     Oid foreigntableid,
+                     int numParams,
+                     FmgrInfo **param_flinfo,
+                     List **param_exprs,
+                     const char ***param_values,
+                     Oid **param_types,
+                     TDengineType * *param_tdengine_types,
+                     TDengineValue * *param_tdengine_values,
+                     TDengineColumnInfo * *param_column_info)
+{
+    int         i;
+    ListCell   *lc;
+
+    /* 验证参数数量必须大于0 */
+    Assert(numParams > 0);
+
+    /* 分配各种参数信息的内存空间 */
+    *param_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * numParams);
+    *param_types = (Oid *) palloc0(sizeof(Oid) * numParams);
+    *param_tdengine_types = (TDengineType *) palloc0(sizeof(TDengineType) * numParams);
+    *param_tdengine_values = (TDengineValue *) palloc0(sizeof(TDengineValue) * numParams);
+    *param_column_info = (TDengineColumnInfo *)palloc0(sizeof(TDengineColumnInfo) * numParams);
+
+    /* 遍历每个FDW表达式 */
+    i = 0;
+    foreach(lc, fdw_exprs)
+    {
+        Node       *param_expr = (Node *) lfirst(lc);
+        Oid         typefnoid;
+        bool        isvarlena;
+
+        /* 获取参数表达式类型 */
+        (*param_types)[i] = exprType(param_expr);
+        /* 获取类型输出函数信息 */
+        getTypeOutputInfo(exprType(param_expr), &typefnoid, &isvarlena);
+        fmgr_info(typefnoid, &(*param_flinfo)[i]);
+
+        /* 如果是时间类型参数 */
+        if (TDENGINE_IS_TIME_TYPE((*param_types)[i]))
+        {
+            ListCell *expr_cell;
+
+            /* 检查参数是否在远程表达式中 */
+            foreach (expr_cell, remote_exprs)
+            {
+                Node *qual = (Node *)lfirst(expr_cell);
+
+                if (tdengine_param_belong_to_qual(qual, param_expr))
+                {
+                    Var           *col;
+                    char       *column_name;
+                    List       *column_list = pull_var_clause(qual, PVC_RECURSE_PLACEHOLDERS);
+
+                    /* 提取相关列信息 */
+                    col = linitial(column_list);
+                    column_name = tdengine_get_column_name(foreigntableid, col->varattno);
+
+                    /* 根据列名确定列类型 */
+                    if (TDENGINE_IS_TIME_COLUMN(column_name))
+                        (*param_column_info)[i].column_type = TDENGINE_TIME_KEY;
+                    else if (tdengine_is_tag_key(column_name, foreigntableid))
+                        (*param_column_info)[i].column_type = TDENGINE_TAG_KEY;
+                    else
+                        (*param_column_info)[i].column_type = TDENGINE_FIELD_KEY;
+                }
+            }
+        }
+        i++;
+    }
+
+    /* 初始化参数表达式列表 */
+    *param_exprs = (List *) ExecInitExprList(fdw_exprs, node);
+    /* 分配参数值缓冲区 */
+    *param_values = (const char **) palloc0(numParams * sizeof(char *));
+}
+
+/*
+ * 检查参数是否属于条件表达式
+ * 功能: 递归检查参数节点是否出现在条件表达式树中
+ *
+ * 参数:
+ *   @qual: 条件表达式树节点
+ *   @param: 要检查的参数节点
+ *
+ * 处理流程:
+ *   1. 检查条件表达式是否为空，为空直接返回false
+ *   2. 检查当前节点是否与参数节点相等
+ *   3. 递归检查表达式树的所有子节点
+ */
+static bool tdengine_param_belong_to_qual(Node *qual, Node *param)
+{
+    /* 空条件直接返回false */
+    if (qual == NULL)
+        return false;
+
+    /* 当前节点与参数匹配则返回true */
+    if (equal(qual, param))
+        return true;
+
+    /* 递归检查表达式树的所有子节点 */
+    return expression_tree_walker(qual, tdengine_param_belong_to_qual, param);
+}
+
+
+/*
+ * Construct array of query parameter values and bind parameters
+ *
+ */
+
+static void
+process_query_params(ExprContext *econtext,
+					 FmgrInfo *param_flinfo,
+					 List *param_exprs,
+					 const char **param_values,
+					 Oid *param_types,
+					 TDengineType * param_tdengine_types,
+					 TDengineValue * param_tdengine_values,
+					 TDengineColumnInfo *param_column_info)
+{
+	int			nestlevel;
+	int			i;
+	ListCell   *lc;
+
+	nestlevel = tdengine_set_transmission_modes();
+
+	i = 0;
+	foreach(lc, param_exprs)
+	{
+		ExprState  *expr_state = (ExprState *) lfirst(lc);
+		Datum		expr_value;
+		bool		isNull;
+
+		/* Evaluate the parameter expression */
+		expr_value = ExecEvalExpr(expr_state, econtext, &isNull);
+
+		/*
+		 * Get string sentation of each parameter value by invoking
+		 * type-specific output function, unless the value is null.
+		 */
+		if (isNull)
+		{
+			elog(ERROR, "tdengine_fdw : cannot bind NULL due to TDengine does not support to filter NULL value");
+		}
+		else
+		{
+			/* Bind parameters */
+			tdengine_bind_sql_var(param_types[i], i, expr_value, param_column_info,
+								  param_tdengine_types, param_tdengine_values);
+			param_values[i] = OutputFunctionCall(&param_flinfo[i], expr_value);
+		}
+		i++;
+	}
+	tdengine_reset_transmission_modes(nestlevel);
+}
+
+/*
+ * create_cursor - 为外部扫描创建游标并处理查询参数
+ * 功能: 为给定的ForeignScanState节点创建游标，处理查询参数并准备执行
+ *
+ * 参数:
+ *   @node: ForeignScanState节点，包含执行状态和计划信息
+ *
+ * 处理流程:
+ *   1. 获取执行状态(festate)和表达式上下文(econtext)
+ *   2. 检查是否有查询参数需要处理(numParams > 0)
+ *   3. 如果有参数:
+ *      a. 切换到每元组内存上下文(ecxt_per_tuple_memory)避免内存泄漏
+ *      b. 分配参数存储空间
+ *      c. 调用process_query_params处理参数转换和绑定
+ *      d. 切换回原始内存上下文
+ *   4. 标记游标已创建(cursor_exists = true)
+ *
+ * 注意事项:
+ *   - 使用每元组内存上下文处理参数以避免重复扫描时的内存泄漏
+ *   - 参数处理包括类型转换和值绑定
+ *   - 游标创建后需要后续操作来实际执行查询
+ */
+static void
+create_cursor(ForeignScanState *node)
+{
+    // 获取执行状态
+    TDengineFdwExecState *festate = (TDengineFdwExecState *) node->fdw_state;
+    // 获取表达式上下文
+    ExprContext *econtext = node->ss.ps.ps_ExprContext;
+    // 获取参数数量
+    int         numParams = festate->numParams;
+    // 获取参数值数组
+    const char **values = festate->param_values;
+
+    /* 如果有查询参数需要处理 */
+    if (numParams > 0)
+    {
+        MemoryContext oldcontext;
+
+        /* 切换到每元组内存上下文 */
+        oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+        // 分配参数存储空间
+        festate->params = palloc(numParams);
+        // 处理查询参数(类型转换和绑定)
+        process_query_params(econtext,
+                             festate->param_flinfo,
+                             festate->param_exprs,
+                             values,
+                             festate->param_types,
+                             festate->param_tdengine_types,
+                             festate->param_tdengine_values,
+                             festate->param_column_info);
+
+        /* 切换回原始内存上下文 */
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    /* 标记游标已创建 */
+    festate->cursor_exists = true;
+}
 
 
 

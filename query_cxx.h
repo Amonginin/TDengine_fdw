@@ -7,12 +7,12 @@
 /* 表示数据类型的信息 */
 typedef enum TDengineType
 {
-    INFLUXDB_INT64,   // 64位整数类型
-    INFLUXDB_DOUBLE,  // 双精度浮点数类型
-    INFLUXDB_BOOLEAN, // 布尔类型
-    INFLUXDB_STRING,  // 字符串类型
-    INFLUXDB_TIME,    // 时间类型
-    INFLUXDB_NULL,    // 空值类型
+    TDENGINE_INT64,   // 64位整数类型
+    TDENGINE_DOUBLE,  // 双精度浮点数类型
+    TDENGINE_BOOLEAN, // 布尔类型
+    TDENGINE_STRING,  // 字符串类型
+    TDENGINE_TIME,    // 时间类型
+    TDENGINE_NULL,    // 空值类型
 } TDengineType;
 
 /* 表示 TDengine 中的值的信息 */
@@ -55,10 +55,10 @@ typedef struct TDengineResult
 /* 表示表的列类型信息 */
 typedef enum TDengineColumnType
 {
-    INFLUXDB_UNKNOWN_KEY, // 未知类型的列
-    INFLUXDB_TIME_KEY,    // 时间类型的列
-    INFLUXDB_TAG_KEY,     // 标签类型的列
-    INFLUXDB_FIELD_KEY,   // 字段类型的列
+    TDENGINE_UNKNOWN_KEY, // 未知类型的列
+    TDENGINE_TIME_KEY,    // 时间类型的列
+    TDENGINE_TAG_KEY,     // 标签类型的列
+    TDENGINE_FIELD_KEY,   // 字段类型的列
 } TDengineColumnType;
 
 /* 表示表的列信息 */

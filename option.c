@@ -66,7 +66,6 @@ extern Datum tdengine_fdw_validator(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(tdengine_fdw_validator);
 
 bool tdengine_is_valid_option(const char *option, Oid context);
-tdengine_opt *tdengine_get_options(Oid foreigntableid);
 
 /*
  * Validate the generic options given to a FOREIGN DATA WRAPPER, SERVER,
@@ -195,7 +194,7 @@ tdengine_is_valid_option(const char *option, Oid context)
  * 4. 设置默认值并验证必填选项
  */
 tdengine_opt *
-tdengine_get_options(Oid foreigntableid)
+tdengine_get_options(Oid foreigntableid, Oid userid)
 {
     /* 声明变量 */
     ForeignTable *f_table;
