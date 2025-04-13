@@ -99,7 +99,7 @@ int total_affected = 0;
  */
 void insertData(WS_TAOS *taos)
 {
-    // 初始化预处理语句
+    // 1. 调用 ws_stmt_init() 创建参数绑定对象
     WS_STMT *stmt = ws_stmt_init(taos);
     if (stmt == NULL)
     {
@@ -107,7 +107,7 @@ void insertData(WS_TAOS *taos)
         exit(EXIT_FAILURE);
     }
 
-    // 准备INSERT语句模板
+    // 2. 调用 ws_stmt_prepare() 解析 INSERT 语句
     const char *sql = "INSERT INTO ? USING meters TAGS(?,?) VALUES (?,?,?,?)";
     int code = ws_stmt_prepare(stmt, sql, 0);
     checkErrorCode(stmt, code, "Failed to execute ws_stmt_prepare");
@@ -138,6 +138,10 @@ void insertData(WS_TAOS *taos)
         tags[1].is_null = NULL;
         tags[1].num = 1;
 
+        // 3. 如果 INSERT 语句中预留了表名但没有预留 TAGS，
+        // 那么调用 ws_stmt_set_tbname() 来设置表名；
+        // 4. 如果 INSERT 语句中既预留了表名又预留了 TAGS（如 INSERT 语句采取的是自动建表的方式），
+        // 那么调用 ws_stmt_set_tbname_tags() 来设置表名和 TAGS 的值；
         code = ws_stmt_set_tbname_tags(stmt, table_name, tags, 2);
         checkErrorCode(stmt, code, "Failed to set table name and tags\n");
 
@@ -168,7 +172,7 @@ void insertData(WS_TAOS *taos)
         params[3].is_null = NULL;
         params[3].num = 1;
 
-        // 为当前子表插入多行数据
+        // 7. 可以重复第 3 ～ 6 步，为批处理加入更多的数据行；
         for (int j = 0; j < num_of_row; j++)
         {
             // 生成随机数据
@@ -186,13 +190,15 @@ void insertData(WS_TAOS *taos)
             params[2].buffer = &voltage;
             params[3].buffer = &phase;
 
+            // 5. 调用 ws_stmt_bind_param_batch() 以多行的方式设置 VALUES 的值
             code = ws_stmt_bind_param_batch(stmt, params, 4);
             checkErrorCode(stmt, code, "Failed to bind param");
         }
-        // 执行批量插入
+        // 6. 调用 ws_stmt_add_batch() 把当前绑定的参数加入批处理；
         code = ws_stmt_add_batch(stmt);
         checkErrorCode(stmt, code, "Failed to add batch");
 
+        // 8. 调用 ws_stmt_execute() 执行已经准备好的批处理指令；
         int affected_rows = 0;
         code = ws_stmt_execute(stmt, &affected_rows);
         checkErrorCode(stmt, code, "Failed to exec stmt");
@@ -201,7 +207,7 @@ void insertData(WS_TAOS *taos)
         int affected = ws_stmt_affected_rows_once(stmt);
         total_affected += affected;
     }
-    // 输出插入结果并清理资源
+    // 9. 执行完毕，调用 ws_stmt_close() 释放所有资源。
     fprintf(stdout, "Successfully inserted %d rows to power.meters.\n", total_affected);
     ws_stmt_close(stmt);
 }
