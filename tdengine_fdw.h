@@ -295,3 +295,19 @@ extern Datum tdengine_convert_record_to_datum(Oid pgtyp, int pgtypmod, char **ro
 
 extern void tdengine_bind_sql_var(Oid type, int attnum, Datum value, TDengineColumnInfo *param_column_info,
 								  TDengineType * param_tdengine_types, TDengineValue * param_tdengine_values);
+
+/* query.cpp headers */                        
+/* 获取表结构信息，成功返回表信息结构体 */
+extern struct TDengineSchemaInfo_return TDengineSchemaInfo(UserMapping *user, tdengine_opt *opts);
+/* 释放表结构信息内存 */
+extern void TDengineFreeSchemaInfo(struct TableInfo* tableInfo, long long length);
+/* 执行查询并返回结果集 */
+extern struct TDengineQuery_return TDengineQuery(char *query, UserMapping *user, tdengine_opt *opts, TDengineType* ctypes, TDengineValue* cvalues, int cparamNum);
+/* 释放查询结果内存 */
+extern void TDengineFreeResult(TDengineResult* result);
+/* 执行数据插入操作，成功返回NULL */
+extern char* TDengineInsert(char *table_name, UserMapping *user, tdengine_opt *opts, struct TDengineColumnInfo* ccolumns, TDengineType* ctypes, TDengineValue* cvalues, int cparamNum, int cnumSlots);
+/* 检查可连接的TDengine版本信息 */
+extern int check_connected_tdengine_version(char* addr, int port, char* user, char* pass, char* db, char* auth_token, char* retention_policy);
+/* 清理所有客户端缓存连接 */
+extern void cleanup_cxx_client_connection(void);

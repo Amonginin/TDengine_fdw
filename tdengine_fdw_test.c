@@ -436,7 +436,7 @@ tdengineGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntab
         // 获取当前列表项，并将其转换为 RestrictInfo 结构体指针
         RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
 
-        // 检查当前子句是否可以作为远程表达式发送到远程服务器
+        // 检查当前子句是否可以作为远程表达式下推到远程服务器
         if (tdengine_is_foreign_expr(root, baserel, ri->clause, false))
             // 如果可以，则将该子句添加到 fpinfo 的 remote_conds 列表中
             fpinfo->remote_conds = lappend(fpinfo->remote_conds, ri);
