@@ -2,6 +2,12 @@
 	"folders": [
 		{
 			"path": "."
+		},
+		{
+			"path": "../influxdb_fdw"
+		},
+		{
+			"path": "../influxdb-cxx"
 		}
 	],
 	"settings": {

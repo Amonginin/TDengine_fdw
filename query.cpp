@@ -2,7 +2,7 @@
 #include <sstream>
 
 #include "connection.hpp"
-
+#include <taosws.h>
 extern "C"
 {
 #include "query_cxx.h"
