@@ -22,11 +22,11 @@
 // TODO: TDengine支持的函数列表
 /* List of stable function with star argument of TDengine */
 static const char *TDengineStableStarFunction[] = {
-	"influx_count_all",
-	"influx_mode_all",
-	"influx_max_all",
-	"influx_min_all",
-	"influx_sum_all",
+	"tdengine_count_all",
+	"tdengine_mode_all",
+	"tdengine_max_all",
+	"tdengine_min_all",
+	"tdengine_sum_all",
 	"integral_all",
 	"mean_all",
 	"median_all",
@@ -95,15 +95,15 @@ static const char *TDengineUniqueFunction[] = {
 	"triple_exponential_moving_average",
 	"triple_exponential_derivative",
 	"relative_strength_index",
-	"influx_count",
+	"tdengine_count",
 	"integral",
 	"spread",
 	"first",
 	"last",
 	"sample",
-	"influx_time",
-	"influx_fill_numeric",
-	"influx_fill_option",
+	"tdengine_time",
+	"tdengine_fill_numeric",
+	"tdengine_fill_option",
 	NULL};
 
 /* List of supported builtin function of TDengine */
@@ -181,8 +181,8 @@ typedef enum
  *   @can_skip_cast: 外部函数是否可以跳过float8/numeric转换
  *   @can_pushdown_stable: 查询是否包含带星号或正则的stable函数
  *   @can_pushdown_volatile: 查询是否包含volatile函数
- *   @influx_fill_enable: 是否在influx_time()内解析子表达式 TODO:
- *   @have_otherfunc_influx_time_tlist: 目标列表中是否有除influx_time()外的其他函数 TODO:
+ *   @tdengine_fill_enable: 是否在tdengine_time()内解析子表达式 TODO:
+ *   @have_otherfunc_tdengine_time_tlist: 目标列表中是否有除tdengine_time()外的其他函数 TODO:
  *   @has_time_key: 是否与时间键列比较
  *   @has_sub_or_add_operator: 表达式是否包含'+'或'-'运算符
  *   @is_comparison: 是否包含比较操作
@@ -197,8 +197,8 @@ typedef struct foreign_loc_cxt
 	bool can_skip_cast;
 	bool can_pushdown_stable;
 	bool can_pushdown_volatile;
-	bool influx_fill_enable;			   // TODO:
-	bool have_otherfunc_influx_time_tlist; // TODO:
+	bool tdengine_fill_enable;			   // TODO:
+	bool have_otherfunc_tdengine_time_tlist; // TODO:
 	bool has_time_key;
 	bool has_sub_or_add_operator;
 	bool is_comparison;
@@ -253,7 +253,7 @@ typedef enum
  *   @can_skip_cast: 标记外部函数是否可以跳过float8/numeric类型转换
  *   @can_delete_directly: 标记DELETE语句是否可以直接下推执行
  *   @has_bool_cmp: 标记外部是否有布尔比较目标
- *   @influx_fill_expr: 存储fill()函数表达式(FuncExpr结构指针)
+ *   @tdengine_fill_expr: 存储fill()函数表达式(FuncExpr结构指针)
  *   @convert_to_timestamp:
  *     标记在与时间键列比较时，如果其数据类型是带时区的时间戳(timestamp with time zone)，
  *     是否需要转换为不带时区的时间戳(timestamp without time zone)
@@ -273,7 +273,7 @@ typedef struct deparse_expr_cxt
 	bool can_delete_directly;		 /* DELETE statement can pushdown
 									  * directly */
 	bool has_bool_cmp;				 /* outer has bool comparison target */
-	FuncExpr *influx_fill_expr;		 /* Store the fill() function */
+	FuncExpr *tdengine_fill_expr;		 /* Store the fill() function */
 
 	/*
 	 * For comparison with time key column, if its data type is timestamp with time zone,
@@ -570,7 +570,7 @@ bool tdengine_is_foreign_expr(PlannerInfo *root,
 	loc_cxt.collation = InvalidOid;
 	loc_cxt.state = FDW_COLLATE_NONE;
 	loc_cxt.can_skip_cast = false;
-	loc_cxt.influx_fill_enable = false;
+	loc_cxt.tdengine_fill_enable = false;
 	loc_cxt.has_time_key = false;
 	loc_cxt.has_sub_or_add_operator = false;
 	loc_cxt.is_comparison = false;
@@ -680,7 +680,7 @@ tdengine_foreign_expr_walker(Node *node,
 	inner_cxt.can_skip_cast = false;
 	inner_cxt.can_pushdown_stable = false;
 	inner_cxt.can_pushdown_volatile = false;
-	inner_cxt.influx_fill_enable = false;
+	inner_cxt.tdengine_fill_enable = false;
 	inner_cxt.has_time_key = false;
 	inner_cxt.has_sub_or_add_operator = false;
 	inner_cxt.is_comparison = false;
@@ -785,11 +785,11 @@ tdengine_foreign_expr_walker(Node *node,
 
 		/*
 		 * 处理常量类型名称检查
-		 * 功能: 检查常量类型是否为特殊类型"influx_fill_enum"
+		 * 功能: 检查常量类型是否为特殊类型"tdengine_fill_enum"
 		 *      如果是则跳过内置类型检查
 		 */
 		type_name = tdengine_get_data_type_name(c->consttype);
-		if (strcmp(type_name, "influx_fill_enum") == 0)
+		if (strcmp(type_name, "tdengine_fill_enum") == 0)
 			check_type = false;
 
 		/*
@@ -929,12 +929,12 @@ tdengine_foreign_expr_walker(Node *node,
 			return false;
 
 		// TODO: fill()函数相关
-		/* fill() must be inside influx_time() */
-		if (strcmp(opername, "influx_fill_numeric") == 0 ||
-			strcmp(opername, "influx_fill_option") == 0)
+		/* fill() must be inside tdengine_time() */
+		if (strcmp(opername, "tdengine_fill_numeric") == 0 ||
+			strcmp(opername, "tdengine_fill_option") == 0)
 		{
-			if (outer_cxt->influx_fill_enable == false)
-				elog(ERROR, "tdengine_fdw: syntax error influx_fill_numeric() or influx_fill_option() must be embedded inside influx_time() function\n");
+			if (outer_cxt->tdengine_fill_enable == false)
+				elog(ERROR, "tdengine_fdw: syntax error tdengine_fill_numeric() or tdengine_fill_option() must be embedded inside tdengine_time() function\n");
 		}
 
 		/*
@@ -964,17 +964,17 @@ tdengine_foreign_expr_walker(Node *node,
 		}
 
 		/*
-		 * Allow influx_fill_numeric/influx_fill_option() inside
-		 * influx_time() function
+		 * Allow tdengine_fill_numeric/tdengine_fill_option() inside
+		 * tdengine_time() function
 		 */
-		if (strcmp(opername, "influx_time") == 0)
+		if (strcmp(opername, "tdengine_time") == 0)
 		{
-			inner_cxt.influx_fill_enable = true;
+			inner_cxt.tdengine_fill_enable = true;
 		}
 		else
 		{
-			/* There is another function than influx_time in tlist */
-			outer_cxt->have_otherfunc_influx_time_tlist = true;
+			/* There is another function than tdengine_time in tlist */
+			outer_cxt->have_otherfunc_tdengine_time_tlist = true;
 		}
 
 		/*
@@ -988,7 +988,7 @@ tdengine_foreign_expr_walker(Node *node,
 		 * Force to restore the state after deparse subexpression if
 		 * it has been change above
 		 */
-		inner_cxt.influx_fill_enable = false;
+		inner_cxt.tdengine_fill_enable = false;
 
 		if (!is_cast_func)
 			glob_cxt->is_inner_func = false;
@@ -1426,7 +1426,7 @@ tdengine_foreign_expr_walker(Node *node,
 		 * 处理流程:
 		 *   1. 继承外层上下文的标志位:
 		 *      - 跳过类型转换标志(can_skip_cast)
-		 *      - 填充函数启用标志(influx_fill_enable)
+		 *      - 填充函数启用标志(tdengine_fill_enable)
 		 *      - 时间键标志(has_time_key)
 		 *      - 加减操作符标志(has_sub_or_add_operator)
 		 *      - 比较操作标志(is_comparison)
@@ -1448,7 +1448,7 @@ tdengine_foreign_expr_walker(Node *node,
 
 		/* 继承外层上下文标志 */
 		inner_cxt.can_skip_cast = outer_cxt->can_skip_cast;
-		inner_cxt.influx_fill_enable = outer_cxt->influx_fill_enable;
+		inner_cxt.tdengine_fill_enable = outer_cxt->tdengine_fill_enable;
 		inner_cxt.has_time_key = outer_cxt->has_time_key;
 		inner_cxt.has_sub_or_add_operator = outer_cxt->has_sub_or_add_operator;
 		inner_cxt.is_comparison = outer_cxt->is_comparison;
@@ -1485,13 +1485,13 @@ tdengine_foreign_expr_walker(Node *node,
 		/* get function name and schema */
 		opername = get_func_name(agg->aggfnoid);
 
-		// TODO: 适配tdengine
+		// TODO:
 		/* these function can be passed to TDengine */
 		if ((strcmp(opername, "sum") == 0 ||
 			 strcmp(opername, "max") == 0 ||
 			 strcmp(opername, "min") == 0 ||
 			 strcmp(opername, "count") == 0 ||
-			 strcmp(opername, "influx_distinct") == 0 || // TODO: 适配tdengine
+			 strcmp(opername, "tdengine_distinct") == 0 || // TODO: 
 			 strcmp(opername, "spread") == 0 ||
 			 strcmp(opername, "sample") == 0 ||
 			 strcmp(opername, "first") == 0 ||
@@ -1499,12 +1499,12 @@ tdengine_foreign_expr_walker(Node *node,
 			 strcmp(opername, "integral") == 0 ||
 			 strcmp(opername, "mean") == 0 ||
 			 strcmp(opername, "median") == 0 ||
-			 strcmp(opername, "influx_count") == 0 || // TODO: 适配tdengine
-			 strcmp(opername, "influx_mode") == 0 ||
+			 strcmp(opername, "tdengine_count") == 0 || // TODO: 
+			 strcmp(opername, "tdengine_mode") == 0 ||
 			 strcmp(opername, "stddev") == 0 ||
-			 strcmp(opername, "influx_sum") == 0 || // TODO: 适配tdengine
-			 strcmp(opername, "influx_max") == 0 || // TODO: 适配tdengine
-			 strcmp(opername, "influx_min") == 0))	// TODO: 适配tdengine
+			 strcmp(opername, "tdengine_sum") == 0 || // TODO: 
+			 strcmp(opername, "tdengine_max") == 0 || // TODO: 
+			 strcmp(opername, "tdengine_min") == 0))	// TODO: 
 		{
 			is_not_star_func = true;
 		}
@@ -1974,6 +1974,58 @@ tdengine_build_tlist_to_deparse(RelOptInfo *foreignrel)
 }
 
 /*
+ * 反解析远程DELETE语句
+ * 功能: 构建TDengine兼容的DELETE语句并输出到缓冲区
+ *
+ * 参数:
+ *   @buf: 输出缓冲区，用于存储生成的SQL语句
+ *   @root: 规划器信息，包含查询树和规划上下文
+ *   @rtindex: 范围表索引，标识要删除的表
+ *   @rel: 关系描述符，包含表结构信息
+ *   @attname: 属性名称列表，用于WHERE条件
+ *
+ * 处理流程:
+ *   1. 初始化DELETE语句基础部分
+ *   2. 添加表名引用
+ *   3. 遍历属性列表构建WHERE条件
+ *   4. 输出调试日志
+ */
+void
+tdengine_deparse_delete(StringInfo buf, PlannerInfo *root,
+                        Index rtindex, Relation rel,
+                        List *attname)
+{
+    int         i = 0;          // 参数计数器，用于构建参数占位符($1, $2等)
+    ListCell   *lc;             // 列表迭代器
+
+    /* 添加DELETE FROM关键字 */
+    appendStringInfoString(buf, "DELETE FROM ");
+    
+    /* 反解析表名并添加到缓冲区 */
+    tdengine_deparse_relation(buf, rel);
+
+    /* 遍历属性列表构建WHERE条件 */
+    foreach(lc, attname)
+    {
+        int         attnum = lfirst_int(lc);  // 获取当前属性编号
+
+        /* 添加WHERE或AND连接符(第一个条件用WHERE，后续用AND) */
+        appendStringInfo(buf, i == 0 ? " WHERE " : " AND ");
+        
+        /* 反解析列引用(表名.列名形式) */
+        tdengine_deparse_column_ref(buf, rtindex, attnum, -1, root, false, false);
+        
+        /* 添加参数占位符($1, $2等) */
+        appendStringInfo(buf, "=$%d", i + 1);
+        i++;  // 递增参数计数器
+    }
+
+    /* 输出生成的DELETE语句到调试日志 */
+    elog(DEBUG1, "delete:%s", buf->data);
+}
+
+
+/*
  * 反解析SELECT语句
  * 功能: 根据给定的关系、目标列和条件构建TDengine兼容的SELECT语句
  *
@@ -2400,9 +2452,9 @@ tdengine_deparse_explicit_target_list(List *tlist, List **retrieved_attrs,
 
 				get_proname(fe->funcid, func_name);
 				/* 跳过特定函数 */
-				if (strcmp(func_name->data, "influx_time") == 0 ||
-					strcmp(func_name->data, "influx_fill_numeric") == 0 ||
-					strcmp(func_name->data, "influx_fill_option") == 0)
+				if (strcmp(func_name->data, "tdengine_time") == 0 ||
+					strcmp(func_name->data, "tdengine_fill_numeric") == 0 ||
+					strcmp(func_name->data, "tdengine_fill_option") == 0)
 					is_skip_expr = true;
 			}
 
@@ -3291,7 +3343,7 @@ tdengine_deparse_const(Const *node, deparse_expr_cxt *context, int showtype)
 
 		// 特殊处理填充选项枚举类型
 		// TODO:
-		if (strcmp(type_name, "influx_fill_enum") == 0)
+		if (strcmp(type_name, "tdengine_fill_enum") == 0)
 		{
 			tdengine_deparse_fill_option(buf, extval);
 		}
@@ -3383,7 +3435,7 @@ tdengine_deparse_param(Param *node, deparse_expr_cxt *context)
 	}
 }
 
-// TODO: TDengine适配
+// TODO: 
 /*
  * 将PostgreSQL函数名转换为TDengine对应的等效函数名
  *
@@ -3410,9 +3462,9 @@ tdengine_replace_function(char *in)
 {
 	if (strcmp(in, "btrim") == 0)
 		return "trim";
-	else if (strcmp(in, "influx_count") == 0 || strcmp(in, "influx_count_all") == 0)
+	else if (strcmp(in, "tdengine_count") == 0 || strcmp(in, "tdengine_count_all") == 0)
 		return "count";
-	else if (strcmp(in, "influx_distinct") == 0)
+	else if (strcmp(in, "tdengine_distinct") == 0)
 		return "distinct";
 	else if (strcmp(in, "integral_all") == 0)
 		return "integral";
@@ -3420,21 +3472,21 @@ tdengine_replace_function(char *in)
 		return "mean";
 	else if (strcmp(in, "median_all") == 0)
 		return "median";
-	else if (strcmp(in, "influx_mode") == 0 || strcmp(in, "influx_mode_all") == 0)
+	else if (strcmp(in, "tdengine_mode") == 0 || strcmp(in, "tdengine_mode_all") == 0)
 		return "mode";
 	else if (strcmp(in, "spread_all") == 0)
 		return "spread";
 	else if (strcmp(in, "stddev_all") == 0)
 		return "stddev";
-	else if (strcmp(in, "influx_sum") == 0 || strcmp(in, "influx_sum_all") == 0)
+	else if (strcmp(in, "tdengine_sum") == 0 || strcmp(in, "tdengine_sum_all") == 0)
 		return "sum";
 	else if (strcmp(in, "first_all") == 0)
 		return "first";
 	else if (strcmp(in, "last_all") == 0)
 		return "last";
-	else if (strcmp(in, "influx_max") == 0 || strcmp(in, "influx_max_all") == 0)
+	else if (strcmp(in, "tdengine_max") == 0 || strcmp(in, "tdengine_max_all") == 0)
 		return "max";
-	else if (strcmp(in, "influx_min") == 0 || strcmp(in, "influx_min_all") == 0)
+	else if (strcmp(in, "tdengine_min") == 0 || strcmp(in, "tdengine_min_all") == 0)
 		return "min";
 	else if (strcmp(in, "percentile_all") == 0)
 		return "percentile";
@@ -3539,8 +3591,8 @@ tdengine_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	 * 1. fill()函数必须放在GROUP BY子句的末尾
 	 * 2. 在此阶段保存fill表达式但不进行反解析
 	 */
-	if (strcmp(proname, "influx_fill_numeric") == 0 ||
-		strcmp(proname, "influx_fill_option") == 0)
+	if (strcmp(proname, "tdengine_fill_numeric") == 0 ||
+		strcmp(proname, "tdengine_fill_option") == 0)
 	{
 		Assert(list_length(args) == 1); // 确保fill函数只有一个参数
 
@@ -3556,19 +3608,19 @@ tdengine_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 		buf->len = buf->len - 2;
 
 		/* 保存fill()节点以便后续在GROUP BY子句中反解析 */
-		context->influx_fill_expr = node;
+		context->tdengine_fill_expr = node;
 		return;
 	}
 
 	/*
-	 * 处理influx_time()函数转换:
-	 * 将PostgreSQL风格的influx_time()转换为TDengine兼容的time()函数格式
+	 * 处理tdengine_time()函数转换:
+	 * 将PostgreSQL风格的tdengine_time()转换为TDengine兼容的time()函数格式
 	 * 示例转换:
-	 * influx_time(time, interval '2h') → time(2h)
-	 * influx_time(time, interval '2h', interval '1h') → time(2h, 1h)
-	 * influx_time(time, interval '2h', influx_fill_numeric(100)) → time(2h) fill(100)
+	 * tdengine_time(time, interval '2h') → time(2h)
+	 * tdengine_time(time, interval '2h', interval '1h') → time(2h, 1h)
+	 * tdengine_time(time, interval '2h', tdengine_fill_numeric(100)) → time(2h) fill(100)
 	 */
-	if (strcmp(proname, "influx_time") == 0)
+	if (strcmp(proname, "tdengine_time") == 0)
 	{
 		int idx = 0; // 参数索引
 
@@ -3778,7 +3830,7 @@ tdengine_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context)
 	ReleaseSysCache(tuple);
 }
 
-// TODO: TDengine适配
+// TODO: 
 /*
  * 反解析操作符名称
  * 功能: 将PostgreSQL操作符转换为TDengine兼容的操作符表示形式
@@ -4617,7 +4669,7 @@ tdengine_append_group_by_clause(List *tlist, deparse_expr_cxt *context)
 	Assert(!query->groupingSets);
 
 	/* 初始化fill()函数指针为NULL */
-	context->influx_fill_expr = NULL;
+	context->tdengine_fill_expr = NULL;
 
 	/*
 	 * 遍历原始GROUP BY子句(而非处理后的版本)
@@ -4637,7 +4689,7 @@ tdengine_append_group_by_clause(List *tlist, deparse_expr_cxt *context)
 	}
 
 	/* 如果存在fill()函数，追加到GROUP BY子句末尾 */
-	if (context->influx_fill_expr)
+	if (context->tdengine_fill_expr)
 	{
 		ListCell *arg; // 参数列表迭代器
 
@@ -4645,7 +4697,7 @@ tdengine_append_group_by_clause(List *tlist, deparse_expr_cxt *context)
 		appendStringInfo(buf, " fill(");
 
 		/* 遍历fill函数的所有参数并反解析 */
-		foreach (arg, context->influx_fill_expr->args)
+		foreach (arg, context->tdengine_fill_expr->args)
 		{
 			tdengine_deparse_expr((Expr *)lfirst(arg), context);
 		}
@@ -5509,8 +5561,8 @@ bool tdengine_is_foreign_function_tlist(PlannerInfo *root,
 	if (!is_contain_function)
 		return false;
 
-	/* 初始化influx_time函数检查标志 */
-	loc_cxt.have_otherfunc_influx_time_tlist = false;
+	/* 初始化tdengine_time函数检查标志 */
+	loc_cxt.have_otherfunc_tdengine_time_tlist = false;
 
 	/* 遍历目标列表检查每个表达式 */
 	foreach (lc, tlist)
@@ -5537,7 +5589,7 @@ bool tdengine_is_foreign_function_tlist(PlannerInfo *root,
 		loc_cxt.can_skip_cast = false;
 		loc_cxt.can_pushdown_stable = false;
 		loc_cxt.can_pushdown_volatile = false;
-		loc_cxt.influx_fill_enable = false;
+		loc_cxt.tdengine_fill_enable = false;
 		loc_cxt.has_time_key = false;
 		loc_cxt.has_sub_or_add_operator = false;
 
@@ -5602,13 +5654,13 @@ bool tdengine_is_foreign_function_tlist(PlannerInfo *root,
 
 	/*
 	 * 处理无模式类型变量的特殊情况:
-	 * 1. 如果存在无模式字段变量，且目标列表中有除influx_time()外的其他函数，则不下推
+	 * 1. 如果存在无模式字段变量，且目标列表中有除tdengine_time()外的其他函数，则不下推
 	 * 2. 标记需要从远程获取所有实际字段以构建JSON值
 	 * 原因: 函数结果和无模式字段混合时无法正确区分结果列
 	 */
 	if (have_slvar_fields)
 	{
-		if (loc_cxt.have_otherfunc_influx_time_tlist)
+		if (loc_cxt.have_otherfunc_tdengine_time_tlist)
 		{
 			return false;
 		}
